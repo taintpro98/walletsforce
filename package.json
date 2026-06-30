@@ -1,0 +1,51 @@
+{
+  "name": "walletsforce",
+  "version": "0.0.1",
+  "description": "General-purpose in-memory EVM account pool: route, nonce-lane, sign, broadcast, confirm, and replace transactions across many signer addresses.",
+  "keywords": [
+    "evm",
+    "ethereum",
+    "viem",
+    "nonce",
+    "account-pool",
+    "transaction",
+    "signer",
+    "web3",
+    "blockchain"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.5.4"
+  }
+}

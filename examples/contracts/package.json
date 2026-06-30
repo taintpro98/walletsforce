@@ -1,0 +1,21 @@
+{
+  "name": "walletsforce-example-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hardhat project: demo contracts for walletsforce to submit calls against.",
+  "scripts": {
+    "compile": "hardhat compile",
+    "node": "hardhat node --hostname 0.0.0.0",
+    "deploy:local": "hardhat run scripts/deploy.ts --network local"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "hardhat": "^2.22.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.0"
+  }
+}

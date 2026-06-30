@@ -18,9 +18,10 @@ This installs `walletsforce` from the npm registry (see the version in
 ## Run
 
 ```bash
-npm run basic      # offline, zero setup
-npm run testnet    # real on-chain send (needs env vars)
-npm run typecheck  # tsc --noEmit over the examples
+npm run basic          # offline, zero setup
+npm run contract-call  # offline: encode + submit an ERC-20 contract call
+npm run testnet        # real on-chain send (needs env vars)
+npm run typecheck      # tsc --noEmit over the examples
 ```
 
 Examples run directly from TypeScript via [`tsx`](https://github.com/privatenumber/tsx) — no build step.
@@ -29,6 +30,13 @@ Examples run directly from TypeScript via [`tsx`](https://github.com/privatenumb
 
 Submits a tx and waits for confirmation against an inline fake `ChainClient`
 (typed as the real `ChainClient` interface). No RPC, no funds, no real keys.
+
+## `contract-call.ts` — offline, encode + submit a contract call
+
+Shows that walletsforce is ABI-agnostic: you encode calldata yourself (viem's
+`encodeFunctionData`) and pass it as the tx `data`; `to` is the contract address.
+Encodes an ERC-20 `transfer(address,uint256)` and submits it against an inline
+fake `ChainClient`. No RPC, no funds.
 
 ## `testnet.ts` — real on-chain send
 
@@ -50,3 +58,29 @@ npm run testnet
 | `PRIVATE_KEY` | yes | — |
 | `TO` | no | the signer's own address |
 | `CHAIN_ID` | no | `84532` (Base Sepolia) |
+
+## `contracts/` — a local chain + demo contracts (Hardhat + Docker)
+
+A self-contained Hardhat project ([`contracts/`](./contracts)) with a `Counter`
+and an ERC-20 `DemoToken`, plus a Docker stack that runs a local chain **and
+deploys the contracts** in one command:
+
+```bash
+docker compose -f docker-compose.local.yml up --build
+```
+
+This brings up a chain on `http://localhost:8545` (chainId 31337) and publishes
+the deployed **addresses + ABIs** to `deployments/local.json` (here in `examples/`).
+
+Then run the local demo — it loads everything from that file and submits real
+contract calls through walletsforce (it does not deploy anything itself):
+
+```bash
+npm run local
+```
+
+## `local.ts` — submit contract calls against the local stack
+
+Reads `deployments/local.json` (published by docker compose above), then calls
+`Counter.increment()` and `DemoToken.transfer()` through walletsforce, reading
+state before/after to prove the calls landed.

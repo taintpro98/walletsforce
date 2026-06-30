@@ -6,6 +6,8 @@
   "description": "Standalone TypeScript project demonstrating the published walletsforce package.",
   "scripts": {
     "basic": "tsx basic.ts",
+    "contract-call": "tsx contract-call.ts",
+    "local": "tsx local.ts",
     "testnet": "tsx testnet.ts",
     "typecheck": "tsc --noEmit"
   },

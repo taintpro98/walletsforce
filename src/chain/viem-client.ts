@@ -1,55 +1,74 @@
-// Default ChainClient over a viem PublicClient. The RPC method bodies are stubbed
-// (TODO) so the scaffold compiles without pinning to exact viem signatures — fill
-// them using the patterns already proven in apps/dvn/src/{src,dst}-chain-client.ts.
-// classifyError is wired to the real classifier.
+// Default ChainClient over a viem Client. Uses the tree-shakeable action
+// functions from `viem/actions` so the adapter stays decoupled from whichever
+// actions are attached to the client the caller passes in, and robust across
+// viem minor versions. classifyError is wired to the real classifier.
+
+import {
+  type Client,
+  TransactionReceiptNotFoundError,
+} from "viem";
+import {
+  estimateGas,
+  getBalance,
+  getBlock,
+  getBlockNumber,
+  getTransactionCount,
+  getTransactionReceipt,
+  sendRawTransaction,
+} from "viem/actions";
 
 import type { Address, Hash, Hex, SignableTx, Receipt, RpcErrorClass } from "../types";
 import type { ChainClient } from "./index";
 import { classifyRpcError } from "./classify";
 
-/** Minimal surface this adapter needs from a viem PublicClient (kept loose so the
- *  scaffold does not over-constrain the viem version). */
-export interface ViemPublicClientLike {
-  // intentionally untyped here; the real adapter binds a concrete viem client.
-  [method: string]: unknown;
-}
-
 export class ViemChainClient implements ChainClient {
-  constructor(private readonly client: ViemPublicClientLike) {}
+  constructor(private readonly client: Client) {}
 
-  async getTransactionCount(_addr: Address, _tag: "pending" | "latest"): Promise<number> {
-    // TODO: this.client.getTransactionCount({ address, blockTag })
-    throw new Error("ViemChainClient.getTransactionCount: not implemented");
+  async getTransactionCount(addr: Address, tag: "pending" | "latest"): Promise<number> {
+    return getTransactionCount(this.client, { address: addr, blockTag: tag });
   }
 
-  async estimateGas(_tx: SignableTx): Promise<bigint> {
-    // TODO: this.client.estimateGas({ account, to, data, value })
-    throw new Error("ViemChainClient.estimateGas: not implemented");
+  async estimateGas(tx: SignableTx): Promise<bigint> {
+    // SignableTx carries no sender, so we estimate without `account`. `gas` on the
+    // input is a placeholder (the engine calls this precisely to discover it).
+    return estimateGas(this.client, {
+      to: tx.to,
+      data: tx.data,
+      value: tx.value,
+    });
   }
 
-  async getBalance(_addr: Address): Promise<bigint> {
-    // TODO: this.client.getBalance({ address })
-    throw new Error("ViemChainClient.getBalance: not implemented");
+  async getBalance(addr: Address): Promise<bigint> {
+    return getBalance(this.client, { address: addr });
   }
 
   async getBaseFeePerGas(): Promise<bigint | null> {
-    // TODO: (await this.client.getBlock()).baseFeePerGas ?? null
-    throw new Error("ViemChainClient.getBaseFeePerGas: not implemented");
+    const block = await getBlock(this.client, { blockTag: "latest" });
+    return block.baseFeePerGas ?? null;
   }
 
-  async sendRawTransaction(_raw: Hex): Promise<Hash> {
-    // TODO: this.client.sendRawTransaction({ serializedTransaction })
-    throw new Error("ViemChainClient.sendRawTransaction: not implemented");
+  async sendRawTransaction(raw: Hex): Promise<Hash> {
+    return sendRawTransaction(this.client, { serializedTransaction: raw });
   }
 
-  async getTransactionReceipt(_hash: Hash): Promise<Receipt | null> {
-    // TODO: map this.client.getTransactionReceipt({ hash }) -> Receipt | null
-    throw new Error("ViemChainClient.getTransactionReceipt: not implemented");
+  async getTransactionReceipt(hash: Hash): Promise<Receipt | null> {
+    try {
+      const r = await getTransactionReceipt(this.client, { hash });
+      return {
+        status: r.status, // viem yields "success" | "reverted"
+        blockNumber: r.blockNumber,
+        transactionHash: r.transactionHash,
+      };
+    } catch (err) {
+      // Not yet mined: viem throws rather than returning null. Honour the
+      // ChainClient contract (null = pending). Re-throw anything else.
+      if (err instanceof TransactionReceiptNotFoundError) return null;
+      throw err;
+    }
   }
 
   async getBlockNumber(): Promise<bigint> {
-    // TODO: this.client.getBlockNumber()
-    throw new Error("ViemChainClient.getBlockNumber: not implemented");
+    return getBlockNumber(this.client);
   }
 
   classifyError(err: unknown): RpcErrorClass {

@@ -140,9 +140,20 @@ new Eip1559FeeOracle({ priorityFeeWei: 1_500_000_000n });
 
 ### `ChainClient` — read RPC + broadcast
 
-> ⚠️ **`ViemChainClient` is scaffolded but its RPC method bodies are not yet
-> implemented** (they `throw`). Until then, provide your own `ChainClient`
-> implementation backed by a viem `PublicClient`/`WalletClient`:
+`ViemChainClient` is a ready-to-use default over a viem `Client` (pass anything
+created with `createPublicClient`). It uses the tree-shakeable `viem/actions`, so
+it works with any viem client. Or provide your own `ChainClient`:
+
+```ts
+import { createPublicClient, http } from "viem";
+import { ViemChainClient } from "walletsforce";
+
+const chainClient = new ViemChainClient(
+  createPublicClient({ transport: http(process.env.RPC_URL) }),
+);
+```
+
+The interface, if you implement your own:
 
 ```ts
 interface ChainClient {
@@ -275,7 +286,8 @@ class WalletForcePool {
 
 ## Status
 
-This package is a scaffold. What works today vs. what's still stubbed:
+The core engine is implemented and usable. What works today vs. what's still a
+stub:
 
 | Area | Status |
 |---|---|
@@ -288,6 +300,6 @@ This package is a scaffold. What works today vs. what's still stubbed:
 | `start()`/`stop()` Supervisor (single loop, backoff, boot nonce-reseed) | ✅ implemented |
 | Balance refresh + health (inline BalanceMonitor) | ✅ implemented |
 | `LocalKeySigner`, `LegacyFeeOracle`, `Eip1559FeeOracle`, `InMemoryStore` | ✅ implemented |
-| `ViemChainClient` RPC methods | ⏳ stubbed (`throw`) — implement before use |
+| `ViemChainClient` RPC methods | ✅ implemented (over `viem/actions`) |
 | `Funder` (treasury top-up) | ⏳ interface only |
 | Durable `PoolStore` adapter (SQLite) | ⏳ TODO (`InMemoryStore` only) |

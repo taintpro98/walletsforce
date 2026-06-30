@@ -10,7 +10,8 @@ sequential-nonce throughput ceiling, with head-of-line blocking confined to one
 lane.
 
 > Architecture, the full component contract, and the seam interfaces are
-> documented in the sections below.
+> documented below — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the landscape
+> diagram and every component interface in one place.
 
 ---
 

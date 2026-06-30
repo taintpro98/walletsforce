@@ -9,6 +9,8 @@
     "contract-call": "tsx contract-call.ts",
     "local": "tsx local.ts",
     "funder": "tsx funder.ts",
+    "profile": "node --expose-gc --import tsx profile.ts",
+    "profile:cpu": "node --cpu-prof --cpu-prof-dir=./profiles --expose-gc --import tsx profile.ts",
     "testnet": "tsx testnet.ts",
     "typecheck": "tsc --noEmit"
   },

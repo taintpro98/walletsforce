@@ -220,6 +220,40 @@ unbounded and crash-unsafe, so don't ship it for a long-running service.
 
 ---
 
+## Auto-refill drained accounts
+
+Set `minBalanceWei` and the pool marks any account below it unhealthy (the router
+drops it from rotation) and fires `onLowBalance`. To **refill** automatically,
+pass a `funder` — the bundled `TreasuryFunder` tops drained accounts up from a
+treasury account each tick:
+
+```ts
+import { WalletForcePool, TreasuryFunder, LegacyFeeOracle } from "walletsforce";
+
+const feeOracle = new LegacyFeeOracle({ minGasPriceWei: 1_000_000_000n });
+
+const pool = new WalletForcePool({
+  …,
+  feeOracle,
+  minBalanceWei: 10n ** 17n,        // 0.1 — below this, an account is unhealthy
+  funder: new TreasuryFunder({
+    signer: treasurySigner,         // a SEPARATE account holding gas
+    chainClient,
+    feeOracle,
+    chainId: 84005,
+    targetBalanceWei: 5n * 10n ** 17n, // top up to 0.5 (set above minBalanceWei)
+    minTreasuryWei: 10n ** 18n,        // never spend the treasury below 1.0
+  }),
+});
+```
+
+`TreasuryFunder` serializes its sends on its own nonce lane, sends at most one
+top-up per recipient until it lands (no double-funding), and refuses to spend the
+treasury below `minTreasuryWei` (logging instead). Top-up is fire-and-forget: the
+account becomes usable again once the next tick observes the higher balance.
+
+---
+
 ## Multiple chains
 
 A pool is single-chain. Use the registry:
@@ -301,5 +335,5 @@ stub:
 | Balance refresh + health (inline BalanceMonitor) | ✅ implemented |
 | `LocalKeySigner`, `LegacyFeeOracle`, `Eip1559FeeOracle`, `InMemoryStore` | ✅ implemented |
 | `ViemChainClient` RPC methods | ✅ implemented (over `viem/actions`) |
-| `Funder` (treasury top-up) | ⏳ interface only |
+| `Funder` (treasury top-up via `TreasuryFunder`) | ✅ implemented |
 | Durable `PoolStore` adapter (SQLite) | ⏳ TODO (`InMemoryStore` only) |

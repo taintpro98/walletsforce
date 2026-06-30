@@ -14,3 +14,5 @@ export interface Funder {
   /** Top up a low account from a treasury account. */
   maybeTopUp(addr: Address): Promise<void>;
 }
+
+export * from "./treasury-funder";

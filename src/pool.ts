@@ -153,7 +153,14 @@ export class WalletForcePool implements IWalletForcePool {
         if (min !== undefined) {
           const healthy = bal >= min;
           a.setHealthy(healthy);
-          if (!healthy) this.config.onLowBalance?.({ address: a.address, balanceWei: bal });
+          if (!healthy) {
+            this.config.onLowBalance?.({ address: a.address, balanceWei: bal });
+            // Auto-refill if a funder is configured. Don't let a top-up failure
+            // break the tick — it's logged inside the funder.
+            await this.config.funder?.maybeTopUp(a.address).catch((err) =>
+              this.config.logger?.error("funder.maybeTopUp failed", err),
+            );
+          }
         }
       }),
     );
@@ -164,9 +171,21 @@ export class WalletForcePool implements IWalletForcePool {
     const o = submitOptionsSchema.parse(opts);
     const address = this.router.route(this.wallets(), r, o);
     const account = this.accounts.get(address.toLowerCase());
-    if (!account) throw new Error(`no account for ${address}`);
+    // route() acquired a sticky ref for ordered keys; if the submit never reaches a
+    // terminal event (no account / broadcast failure / backpressure), release it
+    // here so the sticky map stays bounded. Otherwise failed ordered submits leak.
+    if (!account) {
+      if (o.orderingKey) this.router.release(o.orderingKey);
+      throw new Error(`no account for ${address}`);
+    }
 
-    const result = await account.submit(r, o);
+    let result: SubmitResult;
+    try {
+      result = await account.submit(r, o);
+    } catch (err) {
+      if (o.orderingKey) this.router.release(o.orderingKey);
+      throw err;
+    }
     this.handleEvent({
       idempotencyKey: o.idempotencyKey,
       orderingKey: o.orderingKey,

@@ -80,6 +80,26 @@ describe("WalletForcePool.waitForConfirmation", () => {
     expect(pool.stats().stickyKeys).toBe(0); // released on terminal
   });
 
+  it("does not leak a sticky ref when an ordered submit fails (backpressure)", async () => {
+    const client = new FakeChainClient();
+    const { pool } = makePool({ signers: [new FakeSigner(ADDR_A)], maxInflightPerAccount: 1 }, client);
+    active = pool;
+    const waiter = pool.waitForConfirmation("k1");
+    await pool.submit({ to: ADDR_A }, { idempotencyKey: "k1", orderingKey: "ord" });
+    expect(pool.stats().stickyKeys).toBe(1);
+    // second submit for the same ordering key hits the in-flight cap and throws
+    await expect(
+      pool.submit({ to: ADDR_A }, { idempotencyKey: "k2", orderingKey: "ord" }),
+    ).rejects.toThrow(/in-flight cap/);
+    // confirm k1 -> its ref releases. If the failed submit had leaked a ref, the
+    // binding would survive with a non-zero count. It must be fully evicted.
+    client.receipt = { status: "success", blockNumber: 100n, transactionHash: hash("1") };
+    client.blockNumber = 100n;
+    pool.start();
+    await waiter;
+    expect(pool.stats().stickyKeys).toBe(0);
+  });
+
   it("rejects on reverted", async () => {
     const client = new FakeChainClient();
     const { pool } = makePool({}, client);
@@ -101,6 +121,22 @@ describe("WalletForcePool events / state", () => {
     pool.off("broadcast", cb);
     await pool.submit({ to: ADDR_A }, { idempotencyKey: "k1" });
     expect(seen).toHaveLength(0);
+  });
+
+  it("calls funder.maybeTopUp for accounts below minBalanceWei", async () => {
+    const client = new FakeChainClient();
+    client.balance = 1n; // below the threshold
+    const topped: string[] = [];
+    const funder = { maybeTopUp: async (addr: string) => { topped.push(addr.toLowerCase()); } };
+    const { pool } = makePool(
+      { signers: [new FakeSigner(ADDR_A)], minBalanceWei: 1_000n, funder: funder as never },
+      client,
+    );
+    active = pool;
+    pool.start();
+    await new Promise((r) => setTimeout(r, 30)); // let the first tick run refreshBalances
+    await pool.stop();
+    expect(topped).toContain(ADDR_A.toLowerCase());
   });
 
   it("wallets() reports one state per signer", () => {

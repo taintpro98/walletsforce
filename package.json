@@ -1,7 +1,15 @@
 {
   "name": "walletsforce",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "General-purpose in-memory EVM account pool: route, nonce-lane, sign, broadcast, confirm, and replace transactions across many signer addresses.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taintpro98/walletsforce.git"
+  },
+  "homepage": "https://github.com/taintpro98/walletsforce#readme",
+  "bugs": {
+    "url": "https://github.com/taintpro98/walletsforce/issues"
+  },
   "keywords": [
     "evm",
     "ethereum",
@@ -41,14 +49,17 @@
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build"
   },
+  "peerDependencies": {
+    "viem": "^2.21.0"
+  },
   "dependencies": {
-    "viem": "^2.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsup": "^8.3.0",
     "typescript": "^5.5.4",
+    "viem": "^2.21.0",
     "vitest": "^2.1.0"
   }
 }

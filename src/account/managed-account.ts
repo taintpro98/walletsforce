@@ -54,6 +54,9 @@ interface InflightEntry {
   idempotencyKey: string;
   orderingKey?: string;
   metadata?: Record<string, unknown>;
+  /** false for reattached txs: their `signable` is a placeholder (no calldata), so
+   *  they can be tracked/confirmed but NOT autonomously replaced. */
+  replaceable: boolean;
 }
 
 export class ManagedAccount {
@@ -98,6 +101,7 @@ export class ManagedAccount {
           idempotencyKey: opts.idempotencyKey,
           orderingKey: opts.orderingKey,
           metadata: opts.metadata,
+          replaceable: true, // we hold the full signed tx, so we can re-sign it
         });
 
         return { account: this.address, nonce, hash, fees };
@@ -129,6 +133,7 @@ export class ManagedAccount {
       idempotencyKey: tx.idempotencyKey,
       orderingKey: tx.orderingKey,
       metadata: tx.metadata,
+      replaceable: false, // placeholder signable (no calldata) — never re-sign it
     });
     this.lane.reseed(tx.nonce + 1);
   }
@@ -163,6 +168,12 @@ export class ManagedAccount {
         }
 
         if (Date.now() - entry.submittedAt >= this.deps.stuckAfterMs) {
+          if (!entry.replaceable) {
+            // Reattached tx: we lack the calldata to re-sign it, so we cannot bump
+            // it. Keep polling its original hash — broadcasting the placeholder would
+            // send a garbage tx and loop forever. (Re-broadcast it yourself if needed.)
+            continue;
+          }
           if (entry.attempts >= this.deps.maxAttempts) {
             this.settle(nonce, entry, "failed", `unmined after ${entry.attempts} attempts`);
             continue;

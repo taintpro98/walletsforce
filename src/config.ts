@@ -3,6 +3,7 @@ import type { Signer } from "./signer";
 import type { ChainClient } from "./chain";
 import type { FeeOracle } from "./fee";
 import type { WalletSelector } from "./routing";
+import type { Funder } from "./balance";
 
 export interface WalletPoolConfig {
   /** Static-partition owner id. This instance owns exactly `signers`. */
@@ -28,5 +29,8 @@ export interface WalletPoolConfig {
   /** Below this -> account marked unhealthy, dropped from rotation. */
   minBalanceWei?: bigint;
   onLowBalance?: (w: { address: Address; balanceWei: bigint }) => void;
+  /** Optional auto-refill. When set, the supervisor calls `funder.maybeTopUp(addr)`
+   *  for every account below `minBalanceWei` each tick. See `TreasuryFunder`. */
+  funder?: Funder;
   logger?: Logger;
 }

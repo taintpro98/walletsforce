@@ -134,6 +134,32 @@ describe("ManagedAccount.reattach / primeNonce", () => {
     expect(acct.state().nonceCursor).toBe(42);
   });
 
+  it("never replaces a reattached (placeholder) tx — keeps polling instead of broadcasting garbage", async () => {
+    const { acct, client, events, signer } = setup({ stuckAfterMs: 0, maxAttempts: 3 });
+    acct.reattach({
+      idempotencyKey: "r1",
+      account: ADDR_A,
+      nonce: 5,
+      hash: hash("9"),
+      fees: { type: "legacy", gasPrice: 1n },
+    });
+    client.receipt = null; // not mined yet -> "stuck" since stuckAfterMs=0
+
+    await acct.confirmTick();
+    // must NOT have signed/broadcast a replacement (the placeholder has no calldata)
+    expect(signer.signed).toHaveLength(0);
+    expect(events.find((e) => e.status === "replaced")).toBeUndefined();
+    expect(events.find((e) => e.status === "failed")).toBeUndefined();
+    expect(acct.state().inflightCount).toBe(1); // still tracked, not spinning to failure
+
+    // and it confirms normally once the original tx lands
+    client.receipt = { status: "success", blockNumber: 100n, transactionHash: hash("9") };
+    client.blockNumber = 100n;
+    await acct.confirmTick();
+    expect(statuses(events)).toContain("confirmed");
+    expect(acct.state().inflightCount).toBe(0);
+  });
+
   it("primeNonce seeds the cursor from the chain's pending count", async () => {
     const { acct, client } = setup();
     client.txCount = 9;

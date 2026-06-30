@@ -11,7 +11,14 @@ import type { Router, WalletSelector } from "./index";
  *    not by all keys ever seen.
  */
 export class DefaultRouter implements Router {
+  // orderingKey -> the account it's pinned to. The first request for a key picks an
+  // account and records it here; every later request with that key reuses the pin,
+  // so the key's txs all go through one nonce lane and stay FIFO-ordered.
   private readonly sticky = new Map<string, Address>();
+  // orderingKey -> refcount of its in-flight/queued txs. route()/bind() increment it,
+  // release() decrements; at 0 the key's pin is evicted from `sticky`. This keeps the
+  // map bounded by *active* keys, not every key ever seen (which would grow without
+  // bound for high-cardinality keys like per-sender ids).
   private readonly active = new Map<string, number>();
 
   constructor(private readonly selector: WalletSelector) {}

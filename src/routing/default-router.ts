@@ -1,62 +1,43 @@
 import type { Address, TxRequest, SubmitOptions, WalletState } from "../types";
 import type { Router, WalletSelector } from "./index";
+import type { PoolCache } from "../cache";
 
-/** Sticky-by-orderingKey router with ref-counted eviction.
+/** Sticky-by-orderingKey router whose bindings live in the PoolCache.
  *
- *  - First request for a key picks an account (healthy candidates preferred) and
- *    pins it. Subsequent requests reuse the pin and DO NOT migrate — migrating a
- *    key with in-flight work to another account would break nonce ordering.
+ *  - First request for a key picks an account (healthy preferred) and pins it in
+ *    the cache. Subsequent requests reuse the pin and DO NOT migrate (would break
+ *    nonce ordering). In group mode the cache is shared, so every pod agrees.
  *  - Each ordered request acquires a ref; each terminal tx releases one. At zero
- *    refs the binding is evicted, so the sticky map is bounded by *active* keys,
- *    not by all keys ever seen.
+ *    refs the binding is evicted, so the sticky set is bounded by *active* keys.
  */
 export class DefaultRouter implements Router {
-  // orderingKey -> the account it's pinned to. The first request for a key picks an
-  // account and records it here; every later request with that key reuses the pin,
-  // so the key's txs all go through one nonce lane and stay FIFO-ordered.
-  private readonly sticky = new Map<string, Address>();
-  // orderingKey -> refcount of its in-flight/queued txs. route()/bind() increment it,
-  // release() decrements; at 0 the key's pin is evicted from `sticky`. This keeps the
-  // map bounded by *active* keys, not every key ever seen (which would grow without
-  // bound for high-cardinality keys like per-sender ids).
-  private readonly active = new Map<string, number>();
+  constructor(
+    private readonly selector: WalletSelector,
+    private readonly cache: PoolCache,
+    private readonly ownerId: string,
+  ) {}
 
-  constructor(private readonly selector: WalletSelector) {}
-
-  route(candidates: WalletState[], req: TxRequest, opts: SubmitOptions): Address {
+  async route(candidates: WalletState[], req: TxRequest, opts: SubmitOptions): Promise<Address> {
     const healthy = candidates.filter((c) => c.healthy);
     const pool = healthy.length > 0 ? healthy : candidates;
 
     if (!opts.orderingKey) {
       return this.selector.pick(pool, req);
     }
-
-    const key = opts.orderingKey;
-    let addr = this.sticky.get(key);
-    if (!addr) {
-      addr = this.selector.pick(pool, req);
-      this.sticky.set(key, addr);
-    }
-    this.active.set(key, (this.active.get(key) ?? 0) + 1);
-    return addr;
+    // Pin to the preferred account on first touch; reuse the existing pin otherwise.
+    const prefer = this.selector.pick(pool, req);
+    return this.cache.bindOrdering(this.ownerId, opts.orderingKey, prefer);
   }
 
-  bind(orderingKey: string, account: Address): void {
-    if (!this.sticky.has(orderingKey)) this.sticky.set(orderingKey, account);
-    this.active.set(orderingKey, (this.active.get(orderingKey) ?? 0) + 1);
+  async bind(orderingKey: string, account: Address): Promise<void> {
+    await this.cache.bindOrdering(this.ownerId, orderingKey, account);
   }
 
-  release(orderingKey: string): void {
-    const next = (this.active.get(orderingKey) ?? 0) - 1;
-    if (next <= 0) {
-      this.active.delete(orderingKey);
-      this.sticky.delete(orderingKey); // evict — no active work left
-    } else {
-      this.active.set(orderingKey, next);
-    }
+  async release(orderingKey: string): Promise<void> {
+    await this.cache.releaseOrdering(this.ownerId, orderingKey);
   }
 
-  size(): number {
-    return this.sticky.size;
+  size(): Promise<number> {
+    return this.cache.orderingCount(this.ownerId);
   }
 }

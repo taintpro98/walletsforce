@@ -1,12 +1,29 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { WalletForcePool } from "../src/pool";
+import { Supervisor } from "../src/supervisor";
 import { LegacyFeeOracle } from "../src/fee";
+import { InMemoryStore } from "../src/store";
+import { InMemoryCache } from "../src/cache";
+import { createSubstrate, type SubstrateOptions } from "../src/substrate";
 import { FakeChainClient, FakeSigner, ADDR_A, ADDR_B, hash } from "./helpers";
-import type { WalletPoolConfig } from "../src/config";
+import type { WalletPoolConfig, SupervisorConfig } from "../src/config";
 import type { TxEventRecord } from "../src/types";
 
-function makePool(over: Partial<WalletPoolConfig> = {}, client = new FakeChainClient()) {
-  const pool = new WalletForcePool({
+// A combined config carrying both pool- and supervisor-side fields, so one object can
+// seed both in these single-pod tests (the constructors each read their own subset).
+type TestConfig = WalletPoolConfig & SupervisorConfig;
+
+// Build a pool over a substrate (cache + store + bus + the shared account set). `shared`
+// lets a test reuse external cache/store across substrates (a shared store for a
+// crash→restore test, or a shared cache+store for the cross-pod test). Returns the
+// substrate so a separately-built `new Supervisor(config, substrate)` ticks the SAME
+// account set (single-pod) or its own set over the shared backends (cross-pod).
+function makePool(
+  over: Partial<TestConfig> = {},
+  client = new FakeChainClient(),
+  shared: SubstrateOptions = {},
+) {
+  const config: TestConfig = {
     ownerId: "test",
     chainId: 1,
     signers: [new FakeSigner(ADDR_A), new FakeSigner(ADDR_B)],
@@ -15,14 +32,17 @@ function makePool(over: Partial<WalletPoolConfig> = {}, client = new FakeChainCl
     confirmations: 1,
     confirmTickMs: 5,
     ...over,
-  });
-  return { pool, client };
+  };
+  const substrate = createSubstrate(config, shared);
+  const pool = new WalletForcePool(config, substrate);
+  return { pool, config, substrate, client };
 }
 
-let active: WalletForcePool | null = null;
+// the supervisor(s) started during a test — stopped in teardown
+let active: Array<{ stop(): Promise<void> }> = [];
 afterEach(async () => {
-  await active?.stop();
-  active = null;
+  await Promise.allSettled(active.map((s) => s.stop()));
+  active = [];
 });
 
 describe("WalletForcePool.submit", () => {
@@ -54,7 +74,7 @@ describe("WalletForcePool.submit", () => {
     const a = await pool.submit({ to: ADDR_A }, { idempotencyKey: "k1", orderingKey: "p" });
     const b = await pool.submit({ to: ADDR_A }, { idempotencyKey: "k2", orderingKey: "p" });
     expect(a.account.toLowerCase()).toBe(b.account.toLowerCase());
-    expect(pool.stats().stickyKeys).toBe(1);
+    expect((await pool.stats()).stickyKeys).toBe(1);
   });
 
   it("applies per-account backpressure", async () => {
@@ -67,26 +87,26 @@ describe("WalletForcePool.submit", () => {
 describe("WalletForcePool.waitForConfirmation", () => {
   it("resolves on confirmed and releases the sticky ref", async () => {
     const client = new FakeChainClient();
-    const { pool } = makePool({}, client);
-    active = pool;
+    const { pool, config, substrate } = makePool({}, client);
     await pool.submit({ to: ADDR_A }, { idempotencyKey: "k1", orderingKey: "p" });
-    expect(pool.stats().stickyKeys).toBe(1);
+    expect((await pool.stats()).stickyKeys).toBe(1);
     const waiter = pool.waitForConfirmation("k1");
     client.receipt = { status: "success", blockNumber: 100n, transactionHash: hash("1") };
     client.blockNumber = 100n;
-    pool.start();
+    const sup = new Supervisor(config, substrate);
+    active.push(sup);
+    sup.start();
     const rec = await waiter;
     expect(rec.status).toBe("confirmed");
-    expect(pool.stats().stickyKeys).toBe(0); // released on terminal
+    expect((await pool.stats()).stickyKeys).toBe(0); // released on terminal
   });
 
   it("does not leak a sticky ref when an ordered submit fails (backpressure)", async () => {
     const client = new FakeChainClient();
-    const { pool } = makePool({ signers: [new FakeSigner(ADDR_A)], maxInflightPerAccount: 1 }, client);
-    active = pool;
+    const { pool, config, substrate } = makePool({ signers: [new FakeSigner(ADDR_A)], maxInflightPerAccount: 1 }, client);
     const waiter = pool.waitForConfirmation("k1");
     await pool.submit({ to: ADDR_A }, { idempotencyKey: "k1", orderingKey: "ord" });
-    expect(pool.stats().stickyKeys).toBe(1);
+    expect((await pool.stats()).stickyKeys).toBe(1);
     // second submit for the same ordering key hits the in-flight cap and throws
     await expect(
       pool.submit({ to: ADDR_A }, { idempotencyKey: "k2", orderingKey: "ord" }),
@@ -95,19 +115,22 @@ describe("WalletForcePool.waitForConfirmation", () => {
     // binding would survive with a non-zero count. It must be fully evicted.
     client.receipt = { status: "success", blockNumber: 100n, transactionHash: hash("1") };
     client.blockNumber = 100n;
-    pool.start();
+    const sup = new Supervisor(config, substrate);
+    active.push(sup);
+    sup.start();
     await waiter;
-    expect(pool.stats().stickyKeys).toBe(0);
+    expect((await pool.stats()).stickyKeys).toBe(0);
   });
 
   it("rejects on reverted", async () => {
     const client = new FakeChainClient();
-    const { pool } = makePool({}, client);
-    active = pool;
+    const { pool, config, substrate } = makePool({}, client);
     await pool.submit({ to: ADDR_A }, { idempotencyKey: "k1" });
     const waiter = pool.waitForConfirmation("k1");
     client.receipt = { status: "reverted", blockNumber: 100n, transactionHash: hash("1") };
-    pool.start();
+    const sup = new Supervisor(config, substrate);
+    active.push(sup);
+    sup.start();
     await expect(waiter).rejects.toThrow(/reverted/);
   });
 });
@@ -128,29 +151,30 @@ describe("WalletForcePool events / state", () => {
     client.balance = 1n; // below the threshold
     const topped: string[] = [];
     const funder = { maybeTopUp: async (addr: string) => { topped.push(addr.toLowerCase()); } };
-    const { pool } = makePool(
-      { signers: [new FakeSigner(ADDR_A)], minBalanceWei: 1_000n, funder: funder as never },
+    const { config, substrate } = makePool(
+      { signers: [new FakeSigner(ADDR_A)], minBalanceWei: 1_000n },
       client,
     );
-    active = pool;
-    pool.start();
+    const sup = new Supervisor(config, substrate, funder);
+    sup.start();
     await new Promise((r) => setTimeout(r, 30)); // let the first tick run refreshBalances
-    await pool.stop();
+    await sup.stop();
     expect(topped).toContain(ADDR_A.toLowerCase());
   });
 
-  it("wallets() reports one state per signer", () => {
+  it("wallets() reports one state per signer (from the store)", async () => {
     const { pool } = makePool();
-    const w = pool.wallets();
+    await pool.restore(); // seeds the accounts into the store
+    const w = await pool.wallets();
     expect(w).toHaveLength(2);
     expect(w.map((x) => x.address.toLowerCase()).sort()).toEqual(
       [ADDR_A, ADDR_B].map((x) => x.toLowerCase()).sort(),
     );
   });
 
-  it("reattach resumes tracking and binds an ordering key", () => {
+  it("reattach resumes tracking and binds an ordering key", async () => {
     const { pool } = makePool();
-    pool.reattach({
+    await pool.reattach({
       idempotencyKey: "k1",
       account: ADDR_A,
       nonce: 5,
@@ -158,14 +182,100 @@ describe("WalletForcePool events / state", () => {
       fees: { type: "legacy", gasPrice: 1n },
       orderingKey: "p",
     });
-    const state = pool.wallets().find((w) => w.address.toLowerCase() === ADDR_A.toLowerCase());
+    const state = (await pool.wallets()).find((w) => w.address.toLowerCase() === ADDR_A.toLowerCase());
     expect(state?.inflightCount).toBe(1);
-    expect(pool.stats().stickyKeys).toBe(1);
+    expect((await pool.stats()).stickyKeys).toBe(1);
   });
 
-  it("reattach throws for an unknown account", () => {
+  it("restore() rebuilds in-flight state from a shared store (crash → resume)", async () => {
+    const store = new InMemoryStore();
+    // pool 1: submit two ordered txs (broadcast, write-through to the store), then "crash"
+    const { pool: p1 } = makePool({ signers: [new FakeSigner(ADDR_A)], maxInflightPerAccount: 10 }, undefined, { store });
+    await p1.submit({ to: ADDR_A }, { idempotencyKey: "k1", orderingKey: "p" });
+    await p1.submit({ to: ADDR_A }, { idempotencyKey: "k2", orderingKey: "p" });
+    expect((await p1.wallets())[0].inflightCount).toBe(2); // p1 never ran a supervisor
+
+    // pool 2: fresh instance, same store (fresh cache) -> restore() re-tracks both + the sticky binding
+    const { pool: p2 } = makePool({ signers: [new FakeSigner(ADDR_A)], maxInflightPerAccount: 10 }, undefined, { store });
+    const restored = await p2.restore();
+    expect(restored).toBe(2);
+    expect((await p2.wallets())[0].inflightCount).toBe(2);
+    expect((await p2.wallets())[0].nonceCursor).toBe(2); // lane reseeded past the restored nonces
+    expect((await p2.stats()).stickyKeys).toBe(1); // sticky binding rebuilt
+  });
+
+  it("restore() rebroadcasts write-ahead (pending) txs that may not have been sent", async () => {
+    const store = new InMemoryStore();
+    // Simulate a crash right after the write-ahead row was committed but before/at
+    // broadcast: a "pending" tx sits in the store, not yet on-chain.
+    await store.upsertTransaction({
+      idempotencyKey: "k1",
+      ownerId: "test",
+      chainId: 1,
+      account: ADDR_A,
+      nonce: 0,
+      to: ADDR_A,
+      gas: 21_000n,
+      fees: { type: "legacy", gasPrice: 1n },
+      hash: ("0x" + "0".repeat(64)) as `0x${string}`,
+      status: "pending",
+      attempts: 1,
+      submittedAt: 0,
+      minedEmitted: false,
+      replaceable: true,
+      updatedAt: 0,
+    });
+
+    const client = new FakeChainClient();
+    const { pool } = makePool({ signers: [new FakeSigner(ADDR_A)] }, client, { store });
+    const restored = await pool.restore();
+    expect(restored).toBe(1);
+    expect(client.sent).toHaveLength(1); // the pending tx was (re)broadcast
+    expect((await pool.wallets())[0].inflightCount).toBe(1); // now tracked
+  });
+
+  it("a pool with no supervisor started never confirms (the caller owns the loop)", async () => {
+    const client = new FakeChainClient();
+    const { pool } = makePool({ signers: [new FakeSigner(ADDR_A)] }, client);
+    await pool.submit({ to: ADDR_A }, { idempotencyKey: "k1" });
+    client.receipt = { status: "success", blockNumber: 100n, transactionHash: hash("1") };
+    client.blockNumber = 100n;
+    // no Supervisor constructed/started -> no tick -> nothing confirms
+    await new Promise((r) => setTimeout(r, 30));
+    expect((await pool.wallets())[0].inflightCount).toBe(1);
+  });
+
+  it("a separate supervisor confirms a submitter's txs over the shared cache+store", async () => {
+    const cache = new InMemoryCache();
+    const store = new InMemoryStore();
+    const client = new FakeChainClient();
+    // submitter pod: submits (write-through to the SHARED cache+store), no supervisor started.
+    // Its OWN bus (separate process) — cross-pod state is shared via cache+store, not the bus.
+    const { pool: submitter } = makePool({ signers: [new FakeSigner(ADDR_A)] }, client, { cache, store });
+    await submitter.submit({ to: ADDR_A }, { idempotencyKey: "k1" });
+    expect((await submitter.wallets())[0].inflightCount).toBe(1);
+
+    // supervisor pod: same cache+store+signer, its OWN bus (separate process); the
+    // caller constructs a Supervisor from params — no pool needed on this instance.
+    const { config: supConfig, substrate: supSubstrate } = makePool(
+      { signers: [new FakeSigner(ADDR_A)], confirmTickMs: 5 },
+      client,
+      { cache, store },
+    );
+    const sup = new Supervisor(supConfig, supSubstrate);
+    active.push(sup);
+    client.receipt = { status: "success", blockNumber: 100n, transactionHash: hash("1") };
+    client.blockNumber = 100n;
+    sup.start();
+    for (let i = 0; i < 20 && (await submitter.wallets())[0].inflightCount > 0; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect((await submitter.wallets())[0].inflightCount).toBe(0); // supervisor settled it via the shared cache
+  });
+
+  it("reattach throws for an unknown account", async () => {
     const { pool } = makePool();
-    expect(() =>
+    await expect(
       pool.reattach({
         idempotencyKey: "k1",
         account: ("0x" + "9".repeat(40)) as never,
@@ -173,6 +283,6 @@ describe("WalletForcePool events / state", () => {
         hash: hash("1"),
         fees: { type: "legacy", gasPrice: 1n },
       }),
-    ).toThrow(/no account/);
+    ).rejects.toThrow(/no account/);
   });
 });

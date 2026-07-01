@@ -1,14 +1,10 @@
-// OPTIONAL sugar — NOT a core component. walletsforce persists nothing itself;
-// the caller owns durability via on()/reattach(). This adapter wires those hooks
-// to a store for services that have none of their own.
+// Durability. walletsforce's recoverable state is modelled as two tables —
+// `accounts` and `transactions` (see records.ts). The pool write-throughs its
+// in-memory state to a PoolStore and rebuilds it via pool.restore() on boot.
+// Default store is in-memory (nothing persisted); swap in a SQL store for recovery.
 
-import type { Address, TxEventRecord } from "../types";
-
-export interface PoolStore {
-  /** Write-through on each lifecycle event. */
-  record(rec: TxEventRecord): Promise<void>;
-  /** Non-terminal records for these wallets — feeds reattach() on boot. */
-  loadActive(wallets: Address[]): Promise<TxEventRecord[]>;
-}
-
+export * from "./models";
+export * from "./interface";
 export * from "./in-memory.store";
+export * from "./sqlite.store";
+export * from "./factory";

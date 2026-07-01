@@ -1,15 +1,9 @@
-// One per address — the unit of parallelism. Composes a NonceLane with the send
-// pipeline (SubmissionEngine) and the confirm/replace loop (ConfirmTracker),
-// folded in here for the scaffold.
-//
-// MEMORY:
-//  - `inflight` is bounded: every entry reaches a terminal state and is deleted
-//    via settle(). A tx that never mines is retried up to `maxAttempts`, then
-//    `failed` and removed — nothing is retained forever.
-//  - `pending` (queued + unconfirmed) is capped at `maxInflight`: submit() throws
-//    when full, so a fast producer can't grow this account's memory without bound.
-//  - the largest per-entry cost is the retained `signable` (incl. calldata),
-//    needed to re-sign a same-nonce replacement; released on settle.
+// One per address — the unit of parallelism. Operates on two pluggable layers:
+//   PoolCache  — fast working set: nonce lane, in-flight txs, account gauge.
+//   PoolStore  — durable record (write-ahead + history) for crash recovery.
+// No operational state lives in this object anymore; it's all in the cache (so a
+// shared/Redis cache makes many pods coordinate). The store is written store-first
+// for durability; the cache holds the live working set the hot path reads.
 
 import type {
   Address,
@@ -19,8 +13,9 @@ import type {
   SubmitOptions,
   SubmitResult,
   ReattachInput,
-  WalletState,
   TxStatus,
+  TxEvent,
+  TerminalStatus,
   TxEventRecord,
   SignableTx,
   Logger,
@@ -28,209 +23,218 @@ import type {
 import type { Signer } from "../signer";
 import type { FeeOracle, FeeContext } from "../fee";
 import type { ChainClient } from "../chain";
-import { NonceLane } from "./nonce-lane";
+import type { PoolStore, TransactionRecord, AccountRecord } from "../store";
+import type { PoolCache } from "../cache";
+
+const ZERO_HASH = ("0x" + "0".repeat(64)) as Hash;
+const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export interface ManagedAccountDeps {
   signer: Signer;
   chainClient: ChainClient;
   feeOracle: FeeOracle;
   chainId: number;
+  ownerId: string;
   confirmations: number;
   stuckAfterMs: number;
   maxAttempts: number;
-  /** Cap on queued + unconfirmed txs; submit() throws above it. */
+  /** Cap on in-flight txs for this account; submit() throws above it. */
   maxInflight: number;
   /** Lifecycle sink — the pool fans these out + releases sticky refs + waiters. */
   emit: (rec: TxEventRecord) => void;
+  /** Fast working set (nonce lane, in-flight, gauge). */
+  cache: PoolCache;
+  /** Durable record (write-ahead + history). */
+  store: PoolStore;
   logger?: Logger;
-}
-
-interface InflightEntry {
-  signable: SignableTx; // full tx so a replacement re-signs the SAME nonce with bumped fees
-  hash: Hash;
-  attempts: number;
-  submittedAt: number;
-  minedEmitted: boolean;
-  idempotencyKey: string;
-  orderingKey?: string;
-  metadata?: Record<string, unknown>;
-  /** false for reattached txs: their `signable` is a placeholder (no calldata), so
-   *  they can be tracked/confirmed but NOT autonomously replaced. */
-  replaceable: boolean;
 }
 
 export class ManagedAccount {
   readonly address: Address;
-  private readonly lane: NonceLane;
-  private readonly inflight = new Map<number, InflightEntry>();
-  /** queued + unconfirmed; the value the cap is enforced against. */
-  private pending = 0;
-  private balanceWei = 0n;
-  private healthy = true;
 
   constructor(private readonly deps: ManagedAccountDeps) {
     this.address = deps.signer.address;
-    this.lane = new NonceLane(this.address, deps.chainClient);
   }
 
-  /** Allocate a nonce, build + sign + broadcast. Resolves on broadcast. Throws
-   *  when the account is at its in-flight cap (backpressure). */
+  /** Allocate a nonce (cache lane), write-ahead to the store, broadcast, then record
+   *  the broadcast in store (durable) + cache (operational). Resolves on broadcast. */
   async submit(req: TxRequest, opts: SubmitOptions): Promise<SubmitResult> {
-    if (this.pending >= this.deps.maxInflight) {
-      throw new Error(
-        `account ${this.address} at in-flight cap (${this.deps.maxInflight})`,
-      );
-    }
-    this.pending++;
-    try {
-      return await this.lane.withNextNonce(async (nonce) => {
-        const fees = await this.deps.feeOracle.estimate(this.feeCtx(0));
-        const gas =
-          req.gasLimit ??
-          (await this.deps.chainClient.estimateGas(this.buildSignable(req, nonce, fees, 0n)));
-        const signable = this.buildSignable(req, nonce, fees, gas);
+    return this.deps.cache.withNonce(this.address, async (nonce) => {
+      // Backpressure — checked inside the lane, so the count is accurate per account.
+      if ((await this.deps.cache.countTxs(this.address)) >= this.deps.maxInflight) {
+        throw new Error(`account ${this.address} at in-flight cap (${this.deps.maxInflight})`);
+      }
+      const fees = await this.deps.feeOracle.estimate(this.feeCtx(0));
+      const gas =
+        req.gasLimit ??
+        (await this.deps.chainClient.estimateGas(this.buildSignable(req, nonce, fees, 0n)));
+      const signable = this.buildSignable(req, nonce, fees, gas);
+      const rec = this.newRecord(nonce, signable, ZERO_HASH, "pending", opts);
+
+      // WRITE-AHEAD: durably record intent before broadcasting (awaited; fatal).
+      await this.deps.store.upsertTransaction(rec);
+
+      let hash: Hash;
+      try {
         const raw = await this.deps.signer.signTransaction(signable);
-        const hash = await this.deps.chainClient.sendRawTransaction(raw);
+        hash = await this.deps.chainClient.sendRawTransaction(raw);
+      } catch (err) {
+        // Never entered the mempool — drop the write-ahead row; reseed on nonce-drift.
+        await this.deps.store
+          .upsertTransaction({ ...rec, status: "failed", error: msg(err), updatedAt: Date.now() })
+          .catch(() => undefined);
+        await this.reseedOnDrift(err, nonce);
+        throw err;
+      }
 
-        this.inflight.set(nonce, {
-          signable,
-          hash,
-          attempts: 1,
-          submittedAt: Date.now(),
-          minedEmitted: false,
-          idempotencyKey: opts.idempotencyKey,
-          orderingKey: opts.orderingKey,
-          metadata: opts.metadata,
-          replaceable: true, // we hold the full signed tx, so we can re-sign it
-        });
-
-        return { account: this.address, nonce, hash, fees };
-      });
-    } catch (err) {
-      this.pending = Math.max(0, this.pending - 1); // broadcast failed; no entry retained
-      throw err;
-    }
+      const live: TransactionRecord = { ...rec, hash, status: "broadcast", updatedAt: Date.now() };
+      await this.deps.store.upsertTransaction(live); // store-first (durable)
+      await this.deps.cache.putTx(live); // operational (now tracked by confirmTick)
+      return { account: this.address, nonce, hash, fees };
+    });
   }
 
-  /** Resume tracking a previously-broadcast tx after a restart. Not capped (boot
-   *  restore must succeed). NOTE: the placeholder `signable` has no calldata, so a
-   *  reattached tx can be confirmed but not autonomously replaced — pass the full
-   *  tx here later if post-restart replacement is needed. */
-  reattach(tx: ReattachInput): void {
-    this.pending++;
-    this.inflight.set(tx.nonce, {
-      signable: {
-        chainId: this.deps.chainId,
-        nonce: tx.nonce,
-        to: "0x0000000000000000000000000000000000000000" as Address,
-        gas: 0n,
-        fees: tx.fees,
-      },
+  /** Resume tracking a previously-broadcast tx (manual escape hatch). Placeholder
+   *  signable (no calldata) -> confirm-only, never replaced. Store-first. */
+  async reattach(tx: ReattachInput): Promise<void> {
+    const rec: TransactionRecord = {
+      idempotencyKey: tx.idempotencyKey,
+      ownerId: this.deps.ownerId,
+      chainId: this.deps.chainId,
+      account: this.address.toLowerCase() as Address,
+      nonce: tx.nonce,
+      to: "0x0000000000000000000000000000000000000000" as Address,
+      gas: 0n,
+      fees: tx.fees,
       hash: tx.hash,
+      status: "broadcast",
       attempts: 1,
       submittedAt: Date.now(),
       minedEmitted: false,
-      idempotencyKey: tx.idempotencyKey,
       orderingKey: tx.orderingKey,
       metadata: tx.metadata,
-      replaceable: false, // placeholder signable (no calldata) — never re-sign it
-    });
-    this.lane.reseed(tx.nonce + 1);
+      replaceable: false,
+      updatedAt: Date.now(),
+    };
+    await this.deps.store.upsertTransaction(rec);
+    await this.deps.cache.putTx(rec);
+    await this.deps.cache.seedNonce(this.address, tx.nonce + 1);
   }
 
-  /** One pass over in-flight txs: confirm / detect revert / bump-and-replace /
-   *  give up. settle() deletes the entry and frees its slot so memory stays
-   *  bounded. Per-entry errors are isolated. */
+  /** One pass over the account's in-flight txs (from the cache): confirm / revert /
+   *  bump-and-replace / give up. Every transition is store-first then cache. */
   async confirmTick(): Promise<void> {
-    if (this.inflight.size === 0) return;
+    const txs = await this.deps.cache.listTxs(this.address);
+    if (txs.length === 0) return;
     let head: bigint | null = null;
 
-    for (const [nonce, entry] of [...this.inflight.entries()]) {
+    for (const rec of txs) {
       try {
-        const receipt = await this.deps.chainClient.getTransactionReceipt(entry.hash);
+        const receipt = await this.deps.chainClient.getTransactionReceipt(rec.hash);
 
         if (receipt) {
           if (receipt.status === "reverted") {
-            this.settle(nonce, entry, "reverted");
+            await this.settle(rec, "reverted");
             continue;
           }
           if (head === null) head = await this.deps.chainClient.getBlockNumber();
-          const confirmations = head - receipt.blockNumber + 1n;
-          if (confirmations < BigInt(this.deps.confirmations)) {
-            if (!entry.minedEmitted) {
-              entry.minedEmitted = true;
-              this.emit(entry, "mined");
+          if (head - receipt.blockNumber + 1n < BigInt(this.deps.confirmations)) {
+            if (!rec.minedEmitted) {
+              const mined: TransactionRecord = { ...rec, minedEmitted: true, status: "mined", updatedAt: Date.now() };
+              await this.deps.store.upsertTransaction(mined);
+              await this.deps.cache.putTx(mined);
+              this.notify(mined, "mined");
             }
             continue;
           }
-          this.settle(nonce, entry, "confirmed");
+          await this.settle(rec, "confirmed");
           continue;
         }
 
-        if (Date.now() - entry.submittedAt >= this.deps.stuckAfterMs) {
-          if (!entry.replaceable) {
-            // Reattached tx: we lack the calldata to re-sign it, so we cannot bump
-            // it. Keep polling its original hash — broadcasting the placeholder would
-            // send a garbage tx and loop forever. (Re-broadcast it yourself if needed.)
+        if (Date.now() - rec.submittedAt >= this.deps.stuckAfterMs) {
+          if (rec.replaceable === false) continue; // reattached placeholder — keep polling
+          if (rec.attempts >= this.deps.maxAttempts) {
+            await this.settle(rec, "failed", `unmined after ${rec.attempts} attempts`);
             continue;
           }
-          if (entry.attempts >= this.deps.maxAttempts) {
-            this.settle(nonce, entry, "failed", `unmined after ${entry.attempts} attempts`);
-            continue;
-          }
-          await this.replace(entry);
+          await this.replace(rec);
         }
       } catch (err) {
         const cls = this.deps.chainClient.classifyError(err);
-        const msg = err instanceof Error ? err.message : String(err);
-        if (cls === "transient") {
-          this.deps.logger?.warn(`confirm transient error nonce=${nonce}`, msg);
-        } else {
-          this.deps.logger?.error(`confirm error nonce=${nonce}`, msg);
-        }
-        // leave the entry; next tick retries.
+        if (cls === "transient") this.deps.logger?.warn(`confirm transient nonce=${rec.nonce}`, msg(err));
+        else this.deps.logger?.error(`confirm error nonce=${rec.nonce}`, msg(err));
       }
     }
   }
 
-  /** Boot reconciliation: seed the nonce cursor from chain truth. Best-effort —
-   *  the lane also seeds lazily on first submit, so a failure here is non-fatal. */
+  /** Boot reconciliation: seed the lane cursor from chain truth. */
   async primeNonce(): Promise<void> {
     const n = await this.deps.chainClient.getTransactionCount(this.address, "pending");
-    this.lane.reseed(n);
+    await this.deps.cache.seedNonce(this.address, n);
   }
 
-  state(): WalletState {
-    return {
-      address: this.address,
-      inflightCount: this.inflight.size,
-      nonceCursor: this.lane.nextNonce ?? 0,
-      balanceWei: this.balanceWei,
-      healthy: this.healthy,
-    };
+  /** Refresh balance/health and persist (store + cache). */
+  async refreshState(balanceWei: bigint, healthy: boolean): Promise<void> {
+    const rec = await this.accountRecord(balanceWei, healthy);
+    await this.deps.store.upsertAccount(rec);
+    await this.deps.cache.putAccount(rec);
   }
 
-  setBalance(wei: bigint): void {
-    this.balanceWei = wei;
+  /** Seed a fresh account row (no prior persisted state) into store + cache. */
+  async seed(): Promise<void> {
+    const rec = await this.accountRecord(0n, true);
+    await this.deps.store.upsertAccount(rec);
+    await this.deps.cache.putAccount(rec);
   }
 
-  setHealthy(h: boolean): void {
-    this.healthy = h;
+  /** Boot: rebuild cache lane/gauge from a persisted account row. */
+  async restoreAccountState(rec: AccountRecord): Promise<void> {
+    await this.deps.cache.seedNonce(this.address, rec.nonceCursor);
+    await this.deps.cache.putAccount(rec);
   }
 
-  /** Terminal: drop the entry (frees its slot + retained calldata), free the cap
-   *  slot, and emit. The single place in-flight memory is released. */
-  private settle(nonce: number, entry: InflightEntry, status: TxStatus, error?: string): void {
-    this.inflight.delete(nonce);
-    this.pending = Math.max(0, this.pending - 1);
-    this.emit(entry, status, error);
+  /** Boot: re-track a persisted in-flight tx in the cache + reseed the lane. */
+  async restoreTransaction(rec: TransactionRecord): Promise<void> {
+    await this.deps.cache.putTx(rec);
+    await this.deps.cache.seedNonce(this.address, rec.nonce + 1);
   }
 
-  /** Re-sign the SAME nonce with bumped fees. A nonce-drift on send means the
-   *  original already landed — keep the old hash so the next tick confirms it. */
-  private async replace(entry: InflightEntry): Promise<void> {
-    const fees = await this.deps.feeOracle.bump(entry.signable.fees, this.feeCtx(entry.attempts));
-    const signable: SignableTx = { ...entry.signable, fees };
+  /** Re-send a write-ahead ("pending") tx on boot. Idempotent (deterministic re-sign). */
+  async rebroadcast(nonce: number): Promise<void> {
+    const rec = (await this.deps.cache.listTxs(this.address)).find((t) => t.nonce === nonce);
+    if (!rec) return;
+    try {
+      const raw = await this.deps.signer.signTransaction(this.signableOf(rec));
+      const hash = await this.deps.chainClient.sendRawTransaction(raw);
+      const live = { ...rec, hash, status: "broadcast" as TxStatus, updatedAt: Date.now() };
+      await this.deps.store.upsertTransaction(live);
+      await this.deps.cache.putTx(live);
+    } catch (err) {
+      if (this.deps.chainClient.classifyError(err) === "nonce-drift") {
+        const live = { ...rec, status: "broadcast" as TxStatus, updatedAt: Date.now() };
+        await this.deps.store.upsertTransaction(live);
+        await this.deps.cache.putTx(live);
+        return;
+      }
+      this.deps.logger?.error(`rebroadcast failed nonce=${nonce}`, msg(err));
+    }
+  }
+
+  // ── internals ──────────────────────────────────────────────────────────────
+
+  /** Terminal: persist the terminal row (store-first; throws -> retried), then drop
+   *  it from the cache and notify. Store and cache never disagree. */
+  private async settle(rec: TransactionRecord, status: TerminalStatus, error?: string): Promise<void> {
+    const terminal: TransactionRecord = { ...rec, status, error, updatedAt: Date.now() };
+    await this.deps.store.upsertTransaction(terminal);
+    await this.deps.cache.dropTx(this.address, rec.nonce);
+    this.notify(terminal, status, error);
+  }
+
+  /** Re-sign the SAME nonce with bumped fees; store-first, then cache + notify. */
+  private async replace(rec: TransactionRecord): Promise<void> {
+    const fees = await this.deps.feeOracle.bump(rec.fees, this.feeCtx(rec.attempts));
+    const signable: SignableTx = { ...this.signableOf(rec), fees };
     let hash: Hash;
     try {
       const raw = await this.deps.signer.signTransaction(signable);
@@ -239,47 +243,105 @@ export class ManagedAccount {
       if (this.deps.chainClient.classifyError(err) === "nonce-drift") return;
       throw err;
     }
-    entry.signable = signable;
-    entry.hash = hash;
-    entry.attempts += 1;
-    entry.submittedAt = Date.now();
-    this.emit(entry, "replaced");
+    const updated: TransactionRecord = {
+      ...rec,
+      fees,
+      hash,
+      status: "broadcast",
+      attempts: rec.attempts + 1,
+      submittedAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    await this.deps.store.upsertTransaction(updated);
+    await this.deps.cache.putTx(updated);
+    this.notify(updated, "replaced");
   }
 
-  private emit(entry: InflightEntry, status: TxStatus, error?: string): void {
+  private async reseedOnDrift(err: unknown, nonce: number): Promise<void> {
+    if (this.deps.chainClient.classifyError(err) !== "nonce-drift") return;
+    const chainNonce = await this.deps.chainClient
+      .getTransactionCount(this.address, "pending")
+      .catch(() => 0);
+    await this.deps.cache.seedNonce(this.address, Math.max(chainNonce, nonce + 1));
+  }
+
+  private notify(rec: TransactionRecord, status: TxEvent, error?: string): void {
     this.deps.emit({
-      idempotencyKey: entry.idempotencyKey,
-      orderingKey: entry.orderingKey,
+      idempotencyKey: rec.idempotencyKey,
+      orderingKey: rec.orderingKey,
       account: this.address,
-      nonce: entry.signable.nonce,
-      hash: entry.hash,
-      fees: entry.signable.fees,
+      nonce: rec.nonce,
+      hash: rec.hash,
+      fees: rec.fees,
       status,
-      attempts: entry.attempts,
-      metadata: entry.metadata,
+      attempts: rec.attempts,
+      metadata: rec.metadata,
       error,
       at: Date.now(),
     });
+  }
+
+  private newRecord(
+    nonce: number,
+    signable: SignableTx,
+    hash: Hash,
+    status: TxStatus,
+    opts: SubmitOptions,
+  ): TransactionRecord {
+    return {
+      idempotencyKey: opts.idempotencyKey,
+      ownerId: this.deps.ownerId,
+      chainId: this.deps.chainId,
+      account: this.address.toLowerCase() as Address,
+      nonce,
+      to: signable.to,
+      data: signable.data,
+      value: signable.value,
+      gas: signable.gas,
+      fees: signable.fees,
+      hash,
+      status,
+      attempts: 1,
+      submittedAt: Date.now(),
+      minedEmitted: false,
+      orderingKey: opts.orderingKey,
+      metadata: opts.metadata,
+      replaceable: true,
+      updatedAt: Date.now(),
+    };
+  }
+
+  private signableOf(rec: TransactionRecord): SignableTx {
+    return {
+      chainId: rec.chainId,
+      nonce: rec.nonce,
+      to: rec.to,
+      data: rec.data,
+      value: rec.value,
+      gas: rec.gas,
+      fees: rec.fees,
+    };
+  }
+
+  private async accountRecord(balanceWei: bigint, healthy: boolean): Promise<AccountRecord> {
+    const derivationIndex = (this.deps.signer as { derivationIndex?: number }).derivationIndex;
+    return {
+      ownerId: this.deps.ownerId,
+      chainId: this.deps.chainId,
+      address: this.address.toLowerCase() as Address,
+      derivationIndex,
+      nonceCursor: (await this.deps.cache.peekNonce(this.address)) ?? 0,
+      balanceWei,
+      healthy,
+      updatedAt: Date.now(),
+    };
   }
 
   private feeCtx(attempt: number): FeeContext {
     return { chainId: this.deps.chainId, attempt, client: this.deps.chainClient };
   }
 
-  private buildSignable(
-    req: TxRequest,
-    nonce: number,
-    fees: FeeFields,
-    gas: bigint,
-  ): SignableTx {
-    return {
-      chainId: this.deps.chainId,
-      nonce,
-      to: req.to,
-      data: req.data,
-      value: req.value,
-      gas,
-      fees,
-    };
+  private buildSignable(req: TxRequest, nonce: number, fees: FeeFields, gas: bigint): SignableTx {
+    return { chainId: this.deps.chainId, nonce, to: req.to, data: req.data, value: req.value, gas, fees };
   }
 }

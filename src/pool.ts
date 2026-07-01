@@ -1,9 +1,11 @@
-// The facade — the only surface a service touches. Owns the account set, wires
-// routing, and is the event bus. On every TERMINAL event it releases the sticky
-// ref for that ordering key, so the router's sticky map stays bounded.
+// The facade — the submit surface a service touches. Owns its account set, wires
+// routing, and is the entry point for submit / reattach / restore. It does NOT run
+// the reconciler loop: that's the Supervisor, constructed independently from the
+// same config. Both share the cache + store + event bus (the substrate), so the
+// pool submits and the supervisor confirms over one working set.
 //
-// start()/stop() (the Supervisor that drives confirmTick + balance loops) is still
-// TODO; confirmTick itself is implemented and bounded.
+// Lifecycle events (on / waitForConfirmation) go through the shared EventBus, so a
+// waiter registered here resolves when the supervisor confirms the tx.
 
 import type {
   Address,
@@ -12,20 +14,17 @@ import type {
   SubmitResult,
   ReattachInput,
   TxEvent,
-  TxStatus,
   TxEventRecord,
   WalletState,
 } from "./types";
 import { txRequestSchema, submitOptionsSchema, reattachInputSchema } from "./types";
 import type { WalletPoolConfig } from "./config";
-import { ManagedAccount } from "./account";
+import type { ManagedAccount } from "./account";
 import { DefaultRouter, LeastInflightSelector, type Router } from "./routing";
-
-const TERMINAL: ReadonlySet<TxStatus> = new Set<TxStatus>([
-  "confirmed",
-  "reverted",
-  "failed",
-]);
+import type { PoolStore } from "./store";
+import type { PoolCache } from "./cache";
+import type { EventBus } from "./events";
+import type { Substrate } from "./substrate";
 
 export interface PoolStats {
   wallets: WalletState[];
@@ -34,148 +33,72 @@ export interface PoolStats {
 }
 
 export interface IWalletForcePool {
-  start(): void;
+  /** Boot reconcile — rebuild cache/in-flight state from the store. Alias for
+   *  restore(); the pool has no loop, so this is the whole "start". Returns the
+   *  number of transactions restored. */
+  start(): Promise<number>;
+  /** Graceful stop. The pool is reactive (no timer) and every write is awaited, so
+   *  there is nothing to flush — provided for a symmetric lifecycle. Idempotent. */
   stop(): Promise<void>;
   submit(req: TxRequest, opts: SubmitOptions): Promise<SubmitResult>;
   /** Resolve when this idempotencyKey reaches a terminal state. Resolves on
    *  `confirmed`; rejects on `reverted`/`failed`. Register it right after submit:
    *  it listens for FUTURE events and cannot observe one that already fired. */
   waitForConfirmation(idempotencyKey: string): Promise<TxEventRecord>;
-  reattach(tx: ReattachInput): void;
+  reattach(tx: ReattachInput): Promise<void>;
+  /** Rebuild in-flight state from the configured store. Call once on boot, BEFORE
+   *  submitting new work. Returns how many transactions were restored. */
+  restore(): Promise<number>;
   on(event: TxEvent, cb: (rec: TxEventRecord) => void): void;
   off(event: TxEvent, cb: (rec: TxEventRecord) => void): void;
-  wallets(): WalletState[];
-  stats(): PoolStats;
+  /** Per-account state read from the cache (the live operational view). */
+  wallets(): Promise<WalletState[]>;
+  stats(): Promise<PoolStats>;
 }
 
 export class WalletForcePool implements IWalletForcePool {
-  private readonly accounts = new Map<string, ManagedAccount>();
+  private readonly accounts: Map<string, ManagedAccount>;
   private readonly router: Router;
-  private readonly listeners = new Map<TxEvent, Set<(rec: TxEventRecord) => void>>();
-  /** idempotencyKey -> pending waitForConfirmation resolvers. O(1) dispatch, one
-   *  small entry per active waiter (vs. registering listeners that scan per event). */
-  private readonly waiters = new Map<
-    string,
-    Array<{ resolve: (r: TxEventRecord) => void; reject: (e: Error) => void }>
-  >();
+  private readonly store: PoolStore;
+  private readonly cache: PoolCache;
+  private readonly bus: EventBus;
 
-  // Supervisor state — a SINGLE self-scheduling loop drives all accounts (one
-  // timer total, never per-account/per-tx), with restart-on-error backoff.
-  private running = false;
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private current: Promise<void> = Promise.resolve();
-  private readonly tickMs: number;
-  private errBackoff: number;
-
-  constructor(private readonly config: WalletPoolConfig) {
+  /** @param substrate the shared runtime — cache, store, bus, AND the account set —
+   *  built ONCE with `createSubstrate(config)` (or your own Redis/SQL backends) and
+   *  passed to BOTH the pool and the supervisor. Required: there is no per-instance
+   *  default, and the account set is shared, not rebuilt, so nothing can diverge. */
+  constructor(
+    private readonly config: WalletPoolConfig,
+    substrate: Substrate,
+  ) {
     const selector = config.selector ?? new LeastInflightSelector();
-    this.router = new DefaultRouter(selector);
-    this.tickMs = config.confirmTickMs ?? 4_000;
-    this.errBackoff = this.tickMs;
-
-    const emit = (rec: TxEventRecord) => this.handleEvent(rec);
-    for (const signer of config.signers) {
-      this.accounts.set(
-        signer.address.toLowerCase(),
-        new ManagedAccount({
-          signer,
-          chainClient: config.chainClient,
-          feeOracle: config.feeOracle,
-          chainId: config.chainId,
-          confirmations: config.confirmations ?? 1,
-          stuckAfterMs: config.stuckAfterMs ?? 30_000,
-          maxAttempts: config.maxAttempts ?? 5,
-          maxInflight: config.maxInflightPerAccount ?? 512,
-          emit,
-          logger: config.logger,
-        }),
-      );
-    }
+    this.cache = substrate.cache;
+    this.store = substrate.store;
+    this.bus = substrate.bus;
+    this.accounts = substrate.accounts;
+    this.router = new DefaultRouter(selector, this.cache, config.ownerId);
   }
 
-  /** Reseed nonces from chain, then start the single confirm/balance loop. */
-  start(): void {
-    if (this.running) return;
-    this.running = true;
-    void this.prime();
-    this.scheduleTick(0);
+  async start(): Promise<number> {
+    return this.restore();
   }
 
-  /** Stop scheduling and let the in-flight tick finish. Does NOT wait for on-chain
-   *  txs to confirm — those stay on-chain; reattach them on the next boot. */
-  async stop(): Promise<void> {
-    this.running = false;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    await this.current.catch(() => undefined);
-  }
-
-  private scheduleTick(delayMs: number): void {
-    if (!this.running) return;
-    this.timer = setTimeout(() => {
-      this.current = this.tick();
-    }, delayMs);
-  }
-
-  /** One supervised pass: confirm every account, refresh balances. Self-reschedules
-   *  at the normal cadence on success, or with exponential backoff on an
-   *  unexpected error (per-tx errors are already isolated inside confirmTick). */
-  private async tick(): Promise<void> {
-    if (!this.running) return;
-    let delay = this.tickMs;
-    try {
-      await Promise.allSettled([...this.accounts.values()].map((a) => a.confirmTick()));
-      await this.refreshBalances();
-      this.errBackoff = this.tickMs; // healthy -> reset backoff
-    } catch (err) {
-      this.config.logger?.error("walletsforce tick error", err);
-      this.errBackoff = Math.min(this.errBackoff * 2, 30_000);
-      delay = this.errBackoff;
-    }
-    this.scheduleTick(delay);
-  }
-
-  private async prime(): Promise<void> {
-    await Promise.allSettled([...this.accounts.values()].map((a) => a.primeNonce()));
-  }
-
-  /** Inline BalanceMonitor: refresh each account's balance + health flag. Below
-   *  `minBalanceWei` an account is marked unhealthy (Router drops it from rotation)
-   *  and `onLowBalance` fires. */
-  private async refreshBalances(): Promise<void> {
-    const min = this.config.minBalanceWei;
-    await Promise.allSettled(
-      [...this.accounts.values()].map(async (a) => {
-        const bal = await this.config.chainClient.getBalance(a.address);
-        a.setBalance(bal);
-        if (min !== undefined) {
-          const healthy = bal >= min;
-          a.setHealthy(healthy);
-          if (!healthy) {
-            this.config.onLowBalance?.({ address: a.address, balanceWei: bal });
-            // Auto-refill if a funder is configured. Don't let a top-up failure
-            // break the tick — it's logged inside the funder.
-            await this.config.funder?.maybeTopUp(a.address).catch((err) =>
-              this.config.logger?.error("funder.maybeTopUp failed", err),
-            );
-          }
-        }
-      }),
-    );
+  stop(): Promise<void> {
+    // No timer, and every store/cache write completes before submit()/settle()
+    // resolves, so there is nothing to flush. Present for lifecycle symmetry.
+    return Promise.resolve();
   }
 
   async submit(req: TxRequest, opts: SubmitOptions): Promise<SubmitResult> {
     const r = txRequestSchema.parse(req);
     const o = submitOptionsSchema.parse(opts);
-    const address = this.router.route(this.wallets(), r, o);
+    const address = await this.router.route(await this.walletStates(), r, o);
     const account = this.accounts.get(address.toLowerCase());
     // route() acquired a sticky ref for ordered keys; if the submit never reaches a
     // terminal event (no account / broadcast failure / backpressure), release it
-    // here so the sticky map stays bounded. Otherwise failed ordered submits leak.
+    // here so the sticky set stays bounded. Otherwise failed ordered submits leak.
     if (!account) {
-      if (o.orderingKey) this.router.release(o.orderingKey);
+      if (o.orderingKey) await this.router.release(o.orderingKey).catch(() => undefined);
       throw new Error(`no account for ${address}`);
     }
 
@@ -183,10 +106,10 @@ export class WalletForcePool implements IWalletForcePool {
     try {
       result = await account.submit(r, o);
     } catch (err) {
-      if (o.orderingKey) this.router.release(o.orderingKey);
+      if (o.orderingKey) await this.router.release(o.orderingKey).catch(() => undefined);
       throw err;
     }
-    this.handleEvent({
+    this.bus.handle({
       idempotencyKey: o.idempotencyKey,
       orderingKey: o.orderingKey,
       account: result.account,
@@ -201,62 +124,81 @@ export class WalletForcePool implements IWalletForcePool {
     return result;
   }
 
-  /** Promise form of "wait for this tx". Correlates by idempotencyKey, NOT by
-   *  hash — the hash changes when a stuck tx is replaced. The listener is removed
-   *  on the first terminal event for the key, so it never leaks. */
+  /** Promise form of "wait for this tx" — delegates to the shared bus. Correlates
+   *  by idempotencyKey, NOT hash (the hash changes when a stuck tx is replaced). */
   waitForConfirmation(idempotencyKey: string): Promise<TxEventRecord> {
-    return new Promise<TxEventRecord>((resolve, reject) => {
-      const arr = this.waiters.get(idempotencyKey);
-      if (arr) arr.push({ resolve, reject });
-      else this.waiters.set(idempotencyKey, [{ resolve, reject }]);
-    });
+    return this.bus.waitForConfirmation(idempotencyKey);
   }
 
-  reattach(tx: ReattachInput): void {
+  async reattach(tx: ReattachInput): Promise<void> {
     const t = reattachInputSchema.parse(tx);
     const account = this.accounts.get(t.account.toLowerCase());
     if (!account) throw new Error(`no account for ${t.account}`);
-    account.reattach(t);
-    if (t.orderingKey) this.router.bind(t.orderingKey, t.account);
+    await account.reattach(t);
+    if (t.orderingKey) await this.router.bind(t.orderingKey, t.account);
+  }
+
+  async restore(): Promise<number> {
+    const { ownerId, chainId } = this.config;
+    // Reconcile each owned account with the store into the cache: hydrate from a
+    // persisted row if one exists, else seed a fresh one so the full pool is present.
+    const stored = await this.store.loadAccounts(ownerId, chainId);
+    const byAddr = new Map(stored.map((r) => [r.address.toLowerCase(), r]));
+    for (const [addr, account] of this.accounts) {
+      const rec = byAddr.get(addr);
+      if (rec) await account.restoreAccountState(rec);
+      else await account.seed();
+    }
+    // Re-track in-flight txs from the store into the cache; rebroadcast any
+    // write-ahead ("pending") rows that may not have reached the mempool.
+    const txs = await this.store.loadActiveTransactions(ownerId, chainId);
+    const rebroadcasts: Promise<void>[] = [];
+    for (const rec of txs) {
+      const account = this.accounts.get(rec.account.toLowerCase());
+      if (!account) continue; // a tx for an account this instance no longer owns
+      await account.restoreTransaction(rec);
+      if (rec.orderingKey) await this.router.bind(rec.orderingKey, rec.account); // rebuild sticky binding
+      if (rec.status === "pending") rebroadcasts.push(account.rebroadcast(rec.nonce));
+    }
+    await Promise.allSettled(rebroadcasts);
+    return txs.length;
   }
 
   on(event: TxEvent, cb: (rec: TxEventRecord) => void): void {
-    let set = this.listeners.get(event);
-    if (!set) {
-      set = new Set();
-      this.listeners.set(event, set);
-    }
-    set.add(cb);
+    this.bus.on(event, cb);
   }
 
   off(event: TxEvent, cb: (rec: TxEventRecord) => void): void {
-    this.listeners.get(event)?.delete(cb);
+    this.bus.off(event, cb);
   }
 
-  wallets(): WalletState[] {
-    return [...this.accounts.values()].map((a) => a.state());
+  /** Per-account state, read from the cache (the live operational view; in group
+   *  mode it reflects ALL pods). Iterates the OWNED account set, so routing always
+   *  has candidates even before the cache is seeded. Also the public wallets(). */
+  async wallets(): Promise<WalletState[]> {
+    return this.walletStates();
   }
 
-  stats(): PoolStats {
-    return { wallets: this.wallets(), stickyKeys: this.router.size() };
+  async stats(): Promise<PoolStats> {
+    return { wallets: await this.walletStates(), stickyKeys: await this.router.size() };
   }
 
-  /** Single sink for every lifecycle event: fan out to subscribers, then release
-   *  the sticky ref once an ordered tx reaches a terminal state. */
-  private handleEvent(rec: TxEventRecord): void {
-    for (const cb of this.listeners.get(rec.status) ?? []) cb(rec);
-    if (!TERMINAL.has(rec.status)) return;
-
-    if (rec.orderingKey) this.router.release(rec.orderingKey);
-
-    // Resolve/reject any waitForConfirmation promises for this key, then drop them.
-    const arr = this.waiters.get(rec.idempotencyKey);
-    if (arr) {
-      this.waiters.delete(rec.idempotencyKey);
-      for (const w of arr) {
-        if (rec.status === "confirmed") w.resolve(rec);
-        else w.reject(new Error(`tx ${rec.status}${rec.error ? `: ${rec.error}` : ""} (idempotencyKey=${rec.idempotencyKey})`));
-      }
-    }
+  private async walletStates(): Promise<WalletState[]> {
+    const { ownerId, chainId } = this.config;
+    const gauges = await this.cache.listAccounts(ownerId, chainId);
+    const byAddr = new Map(gauges.map((a) => [a.address.toLowerCase(), a]));
+    return Promise.all(
+      [...this.accounts.keys()].map(async (addr) => {
+        const a = byAddr.get(addr);
+        return {
+          address: (a?.address ?? addr) as Address,
+          inflightCount: await this.cache.countTxs(addr as Address),
+          // the lane cursor is the live value; the gauge's is a snapshot
+          nonceCursor: (await this.cache.peekNonce(addr as Address)) ?? a?.nonceCursor ?? 0,
+          balanceWei: a?.balanceWei ?? 0n,
+          healthy: a?.healthy ?? true, // default healthy until first gauge
+        };
+      }),
+    );
   }
 }

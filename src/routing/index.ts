@@ -14,14 +14,15 @@ export interface WalletSelector {
 }
 
 export interface Router {
-  /** Choose (and, for ordered keys, acquire a ref to) an account. */
-  route(candidates: WalletState[], req: TxRequest, opts: SubmitOptions): Address;
-  /** Re-pin + acquire a ref for a reattached tx on boot. */
-  bind(orderingKey: string, account: Address): void;
+  /** Choose (and, for ordered keys, acquire a ref to) an account. Async because the
+   *  sticky bindings live in the PoolCache (shared across pods in group mode). */
+  route(candidates: WalletState[], req: TxRequest, opts: SubmitOptions): Promise<Address>;
+  /** Re-pin + acquire a ref for a reattached/restored tx on boot. */
+  bind(orderingKey: string, account: Address): Promise<void>;
   /** Release one ref for an ordering key; evict the binding at zero. */
-  release(orderingKey: string): void;
-  /** Current number of sticky bindings — exported for leak observability. */
-  size(): number;
+  release(orderingKey: string): Promise<void>;
+  /** Current number of sticky bindings — for leak observability. */
+  size(): Promise<number>;
 }
 
 export * from "./least-inflight.selector";

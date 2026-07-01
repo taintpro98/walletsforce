@@ -11,7 +11,7 @@ import {
   hexSchema,
   hashSchema,
   feeFieldsSchema,
-  txStatusSchema,
+  txEventSchema,
   metadataSchema,
 } from "./primitives";
 
@@ -73,7 +73,7 @@ export const txEventRecordSchema = z.object({
   account: addressSchema,
   nonce: z.number().int().nonnegative(),
   hash: hashSchema,
-  status: txStatusSchema,
+  status: txEventSchema,
   fees: feeFieldsSchema,
   attempts: z.number().int().nonnegative(),
   metadata: metadataSchema.optional(),

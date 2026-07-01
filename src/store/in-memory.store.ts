@@ -1,23 +1,34 @@
-// In-memory PoolStore. For dev/tests only — a crash loses tracking. A durable
-// adapter (e.g. SQLite) is a TODO; production consumers map on()/reattach() onto
-// their own store instead.
+// Default in-memory PoolStore — the two tables held as Maps. This is walletsforce's
+// original behaviour: nothing survives a crash. Terminal transactions are dropped
+// (not retained as history) so memory stays bounded. Swap in a SQL store to persist.
 
-import type { Address, TxEventRecord, TxStatus } from "../types";
-import type { PoolStore } from "./index";
+import type { PoolStore } from "./interface";
+import type { AccountRecord, TransactionRecord } from "./models";
+import { isTerminal } from "./models";
 
-const TERMINAL: ReadonlySet<TxStatus> = new Set<TxStatus>(["confirmed", "reverted", "failed"]);
+const accountKey = (chainId: number, address: string) => `${chainId}:${address.toLowerCase()}`;
 
 export class InMemoryStore implements PoolStore {
-  private readonly byKey = new Map<string, TxEventRecord>();
+  private readonly accounts = new Map<string, AccountRecord>();
+  private readonly transactions = new Map<string, TransactionRecord>(); // by idempotencyKey
 
-  async record(rec: TxEventRecord): Promise<void> {
-    this.byKey.set(rec.idempotencyKey, rec);
+  async upsertAccount(rec: AccountRecord): Promise<void> {
+    this.accounts.set(accountKey(rec.chainId, rec.address), rec);
   }
 
-  async loadActive(wallets: Address[]): Promise<TxEventRecord[]> {
-    const owned = new Set(wallets.map((w) => w.toLowerCase()));
-    return [...this.byKey.values()].filter(
-      (r) => !TERMINAL.has(r.status) && owned.has(r.account.toLowerCase()),
+  async loadAccounts(ownerId: string, chainId: number): Promise<AccountRecord[]> {
+    return [...this.accounts.values()].filter((a) => a.ownerId === ownerId && a.chainId === chainId);
+  }
+
+  async upsertTransaction(rec: TransactionRecord): Promise<void> {
+    // Bounded memory: a terminal tx is removed rather than retained as history.
+    if (isTerminal(rec.status)) this.transactions.delete(rec.idempotencyKey);
+    else this.transactions.set(rec.idempotencyKey, rec);
+  }
+
+  async loadActiveTransactions(ownerId: string, chainId: number): Promise<TransactionRecord[]> {
+    return [...this.transactions.values()].filter(
+      (t) => t.ownerId === ownerId && t.chainId === chainId && !isTerminal(t.status),
     );
   }
 }

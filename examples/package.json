@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Standalone TypeScript project demonstrating the published walletsforce package.",
+  "description": "Standalone TypeScript project demonstrating walletsforce, linked to the local build via file:..",
   "scripts": {
     "basic": "tsx basic.ts",
+    "durable": "tsx durable.ts",
     "contract-call": "tsx contract-call.ts",
     "local": "tsx local.ts",
     "funder": "tsx funder.ts",
@@ -16,7 +17,7 @@
   },
   "dependencies": {
     "viem": "^2.21.0",
-    "walletsforce": "^0.0.1"
+    "walletsforce": "file:.."
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

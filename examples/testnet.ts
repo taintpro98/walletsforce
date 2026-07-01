@@ -19,9 +19,12 @@
 import { createPublicClient, http } from "viem";
 import {
   WalletForcePool,
+  Supervisor,
+  createSubstrate,
   LocalKeySigner,
   Eip1559FeeOracle,
   ViemChainClient,
+  type WalletConfig,
 } from "walletsforce";
 
 const RPC_URL = process.env.RPC_URL;
@@ -38,17 +41,21 @@ const to = (process.env.TO ?? signer.address) as `0x${string}`;
 
 const publicClient = createPublicClient({ transport: http(RPC_URL) });
 
-const pool = new WalletForcePool({
+// Pool and Supervisor share ONE substrate (cache + store + bus) in this process.
+const config: WalletConfig = {
   ownerId: "testnet-example",
   chainId: CHAIN_ID,
   signers: [signer],
   chainClient: new ViemChainClient(publicClient),
   feeOracle: new Eip1559FeeOracle({ priorityFeeWei: 1_000_000_000n }), // 1 gwei tip
   confirmations: 1,
-  confirmTickMs: 4_000,
-  stuckAfterMs: 30_000,
+  stuckAfterMs: 30_000, // shared: baked into each account (the tick's replace logic reads it)
   maxAttempts: 5,
-});
+};
+const substrate = createSubstrate(config);
+const pool = new WalletForcePool(config, substrate);
+// confirmTickMs (tick cadence) is a supervisor concern — the pool never ticks.
+const supervisor = new Supervisor({ ...config, confirmTickMs: 4_000 }, substrate);
 
 pool.on("broadcast", (r) => console.log(`broadcast: ${r.hash} (nonce ${r.nonce})`));
 pool.on("replaced", (r) => console.log(`replaced (fee bump): ${r.hash}`));
@@ -56,7 +63,8 @@ pool.on("confirmed", (r) => console.log(`confirmed: ${r.hash}`));
 
 console.log(`from ${signer.address} -> to ${to} on chain ${CHAIN_ID}`);
 
-pool.start();
+await pool.start();  // boot reconcile (restore from store) before submitting
+supervisor.start();
 
 const idempotencyKey = `demo-${Date.now()}`;
 const { hash } = await pool.submit({ to, value: 0n }, { idempotencyKey });
@@ -69,5 +77,6 @@ try {
 } catch (err) {
   console.error("❌ tx did not confirm:", (err as Error).message);
 } finally {
+  await supervisor.stop();
   await pool.stop();
 }

@@ -12,9 +12,12 @@
 import { encodeFunctionData, parseAbi, decodeFunctionData } from "viem";
 import {
   WalletForcePool,
+  Supervisor,
+  createSubstrate,
   LocalKeySigner,
   Eip1559FeeOracle,
   type ChainClient,
+  type WalletConfig,
 } from "walletsforce";
 
 // 1. Encode the contract call -> calldata. (This is the part walletsforce leaves to you.)
@@ -67,21 +70,27 @@ const signer = new LocalKeySigner(
   "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
 );
 
-const pool = new WalletForcePool({
+// Pool and Supervisor are independent objects; in one process they share ONE
+// substrate (cache + store + bus) so confirmations reach the pool's waiter.
+const config: WalletConfig = {
   ownerId: "contract-call-example",
   chainId: 84532,
   signers: [signer],
   chainClient,
   feeOracle: new Eip1559FeeOracle({ priorityFeeWei: 1_000_000_000n }), // 1 gwei tip
   confirmations: 1,
-  confirmTickMs: 50,
-});
+};
+const substrate = createSubstrate(config);
+const pool = new WalletForcePool(config, substrate);
+// confirmTickMs is a supervisor concern (the pool never ticks) — so it lives here.
+const supervisor = new Supervisor({ ...config, confirmTickMs: 50 }, substrate);
 
 const TOKEN = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"; // some ERC-20 contract
 
 console.log(`calling transfer(${recipient}, ${amount}) on token ${TOKEN}`);
 
-pool.start();
+await pool.start();  // boot reconcile (restore from store) before submitting
+supervisor.start();
 
 // 3. Submit the contract call: `to` = the contract, `data` = the encoded call.
 const idempotencyKey = "erc20-transfer-1";
@@ -99,5 +108,6 @@ console.log("landed:", receipt.status);
 const { functionName, args } = decodeFunctionData({ abi: erc20, data });
 console.log("decoded:", functionName, args);
 
+await supervisor.stop();
 await pool.stop();
 console.log("\n✅ contract-call example complete");

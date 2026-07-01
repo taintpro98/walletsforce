@@ -1,47 +1,75 @@
 import { describe, it, expect } from "vitest";
 import { InMemoryStore } from "../src/store";
-import type { TxEventRecord, TxStatus, Address } from "../src/types";
+import type { AccountRecord, TransactionRecord } from "../src/store";
+import type { Address, TxStatus, Hash } from "../src/types";
 
-const A = "0x" + "a".repeat(40);
-const B = "0x" + "b".repeat(40);
+const A = ("0x" + "a".repeat(40)) as Address;
+const B = ("0x" + "b".repeat(40)) as Address;
 
-function rec(key: string, account: string, status: TxStatus): TxEventRecord {
+function txRec(key: string, account: Address, status: TxStatus, chainId = 1): TransactionRecord {
   return {
     idempotencyKey: key,
-    account: account as Address,
+    ownerId: "owner-1",
+    chainId,
+    account,
     nonce: 0,
-    hash: ("0x" + "1".repeat(64)) as TxEventRecord["hash"],
-    status,
+    to: B,
+    gas: 21_000n,
     fees: { type: "legacy", gasPrice: 1n },
+    hash: ("0x" + "1".repeat(64)) as Hash,
+    status,
     attempts: 1,
-    at: 0,
+    submittedAt: 0,
+    minedEmitted: false,
+    updatedAt: 0,
   };
 }
 
-describe("InMemoryStore", () => {
-  it("records by idempotencyKey, last write wins", async () => {
+function acctRec(address: Address, chainId = 1): AccountRecord {
+  return { ownerId: "owner-1", chainId, address, nonceCursor: 3, balanceWei: 10n, healthy: true, updatedAt: 0 };
+}
+
+describe("InMemoryStore — accounts", () => {
+  it("upserts and loads accounts by owner+chain", async () => {
     const s = new InMemoryStore();
-    await s.record(rec("k1", A, "broadcast"));
-    await s.record(rec("k1", A, "confirmed"));
-    const active = await s.loadActive([A as Address]);
-    expect(active).toHaveLength(0); // latest state is terminal -> not active
+    await s.upsertAccount(acctRec(A));
+    await s.upsertAccount(acctRec(B, 2)); // different chain
+    const onChain1 = await s.loadAccounts("owner-1", 1);
+    expect(onChain1.map((a) => a.address)).toEqual([A]);
   });
 
-  it("loadActive returns only non-terminal records for owned wallets", async () => {
+  it("last write wins per (chain, address)", async () => {
     const s = new InMemoryStore();
-    await s.record(rec("k1", A, "broadcast"));
-    await s.record(rec("k2", A, "mined"));
-    await s.record(rec("k3", A, "confirmed")); // terminal -> excluded
-    await s.record(rec("k4", A, "reverted")); // terminal -> excluded
-    await s.record(rec("k5", B, "broadcast")); // not owned -> excluded
-    const active = await s.loadActive([A as Address]);
-    expect(active.map((r) => r.idempotencyKey).sort()).toEqual(["k1", "k2"]);
+    await s.upsertAccount({ ...acctRec(A), nonceCursor: 3 });
+    await s.upsertAccount({ ...acctRec(A), nonceCursor: 9 });
+    const [a] = await s.loadAccounts("owner-1", 1);
+    expect(a.nonceCursor).toBe(9);
+  });
+});
+
+describe("InMemoryStore — transactions", () => {
+  it("loadActiveTransactions returns only non-terminal rows for owner+chain", async () => {
+    const s = new InMemoryStore();
+    await s.upsertTransaction(txRec("k1", A, "broadcast"));
+    await s.upsertTransaction(txRec("k2", A, "mined"));
+    await s.upsertTransaction(txRec("k3", A, "replaced")); // non-terminal -> kept
+    await s.upsertTransaction(txRec("k4", B, "broadcast", 2)); // other chain -> excluded
+    const active = await s.loadActiveTransactions("owner-1", 1);
+    expect(active.map((t) => t.idempotencyKey).sort()).toEqual(["k1", "k2", "k3"]);
   });
 
-  it("matches wallet ownership case-insensitively", async () => {
+  it("a terminal status drops the tx (bounded memory)", async () => {
     const s = new InMemoryStore();
-    await s.record(rec("k1", A.toUpperCase().replace("0X", "0x"), "broadcast"));
-    const active = await s.loadActive([A.toLowerCase() as Address]);
-    expect(active).toHaveLength(1);
+    await s.upsertTransaction(txRec("k1", A, "broadcast"));
+    await s.upsertTransaction(txRec("k1", A, "confirmed")); // terminal -> removed
+    const active = await s.loadActiveTransactions("owner-1", 1);
+    expect(active).toHaveLength(0);
+  });
+
+  it("scopes by ownerId", async () => {
+    const s = new InMemoryStore();
+    await s.upsertTransaction({ ...txRec("k1", A, "broadcast"), ownerId: "owner-2" });
+    expect(await s.loadActiveTransactions("owner-1", 1)).toHaveLength(0);
+    expect(await s.loadActiveTransactions("owner-2", 1)).toHaveLength(1);
   });
 });

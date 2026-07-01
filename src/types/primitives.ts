@@ -36,16 +36,35 @@ export const feeFieldsSchema = z.discriminatedUnion("type", [
 ]);
 export type FeeFields = z.infer<typeof feeFieldsSchema>;
 
+/** The status a transaction row is PERSISTED as, across its lifecycle. No "replaced":
+ *  a fee-bump re-broadcasts at the SAME nonce, so the row returns to "broadcast" —
+ *  "replaced" is only an emitted event, never a stored status. */
 export const txStatusSchema = z.enum([
+  "pending", // write-ahead: signed/intended, persisted BEFORE broadcast (internal; never emitted)
   "broadcast",
   "mined",
   "confirmed",
   "reverted",
-  "replaced",
   "failed",
 ]);
 export type TxStatus = z.infer<typeof txStatusSchema>;
-export type TxEvent = TxStatus;
+
+/** The lifecycle events a subscriber can observe (`on` / `waitForConfirmation`).
+ *  Differs from TxStatus: no "pending" (internal write-ahead, never emitted); adds
+ *  "replaced" (a fee-bump notification, which is never a persisted row status). */
+export const txEventSchema = z.enum([
+  "broadcast",
+  "mined",
+  "confirmed",
+  "replaced",
+  "reverted",
+  "failed",
+]);
+export type TxEvent = z.infer<typeof txEventSchema>;
+
+/** Terminal statuses/events — the tx is done (confirmed) or dead (reverted/failed).
+ *  In both TxStatus and TxEvent, so usable where a value must be persisted AND emitted. */
+export type TerminalStatus = "confirmed" | "reverted" | "failed";
 
 /** Opaque caller metadata, echoed back on events. */
 export const metadataSchema = z.record(z.string(), z.unknown());

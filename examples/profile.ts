@@ -17,6 +17,8 @@ import { performance } from "node:perf_hooks";
 import v8 from "node:v8";
 import {
   WalletForcePool,
+  Supervisor,
+  createSubstrate,
   LocalKeySigner,
   LegacyFeeOracle,
   type ChainClient,
@@ -25,6 +27,7 @@ import {
   type Address,
   type Hash,
   type Hex,
+  type WalletConfig,
 } from "walletsforce";
 
 const N = Number(process.env.N ?? "50000");
@@ -57,17 +60,20 @@ const gc = () => { if (hasGc) { globalThis.gc!(); globalThis.gc!(); } };
 const mb = (b: number) => (b / 1024 / 1024).toFixed(1);
 const fmt = (n: number) => n.toLocaleString("en-US");
 
+// Returns the pool AND the shared substrate singleton so benches that need the
+// confirm loop can `new Supervisor(config, substrate)` over the SAME cache+store+bus.
 function makePool(signer: Signer, opts: { maxInflight: number }) {
-  return new WalletForcePool({
+  const config: WalletConfig = {
     ownerId: "profile",
     chainId: 1,
     signers: [signer],
     chainClient: new FastChain(),
     feeOracle: new LegacyFeeOracle({ minGasPriceWei: 1_000_000_000n }),
     confirmations: 1,
-    confirmTickMs: 1,
     maxInflightPerAccount: opts.maxInflight,
-  });
+  };
+  const substrate = createSubstrate(config);
+  return { pool: new WalletForcePool(config, substrate), config, substrate };
 }
 
 const req = () => ({ to: ADDR, data: CALLDATA });
@@ -77,10 +83,10 @@ const req = () => ({ to: ADDR, data: CALLDATA });
 // retained cost per in-flight tx (dominated by the kept signed tx + calldata).
 async function benchSubmit(label: string, signer: Signer) {
   // warm up the JIT on a throwaway pool so the measured pool holds exactly N in-flight
-  const warm = makePool(signer, { maxInflight: 3_000 });
+  const { pool: warm } = makePool(signer, { maxInflight: 3_000 });
   for (let i = 0; i < 2_000; i++) await warm.submit(req(), { idempotencyKey: `w${i}` });
 
-  const pool = makePool(signer, { maxInflight: N + 1 });
+  const { pool } = makePool(signer, { maxInflight: N + 1 });
   gc();
   const heap0 = process.memoryUsage().heapUsed;
   const cpu0 = process.cpuUsage();
@@ -105,7 +111,8 @@ async function benchSubmit(label: string, signer: Signer) {
   console.log(`  wall:              ${(wallMs * 1000 / N).toFixed(2)} µs/op`);
   console.log(`  cpu:               ${(cpuUs / N).toFixed(2)} µs/op  (user+system)`);
   console.log(`  retained heap:     ${mb(heapDelta)} MB for ${fmt(N)} in-flight  ->  ${Math.round(heapDelta / N)} bytes/entry`);
-  console.log(`  pool.stats():      inflight=${fmt(pool.stats().wallets[0].inflightCount)} stickyKeys=${pool.stats().stickyKeys}`);
+  const stats = await pool.stats();
+  console.log(`  pool.stats():      inflight=${fmt(stats.wallets[0].inflightCount)} stickyKeys=${stats.stickyKeys}`);
 }
 
 // === Bench B: submit -> confirm cycle (bounded memory) =======================
@@ -113,8 +120,10 @@ async function benchSubmit(label: string, signer: Signer) {
 async function benchBoundedMemory() {
   const ROUNDS = 20;
   const BATCH = Math.max(1, Math.floor(N / ROUNDS));
-  const pool = makePool(new FakeSigner(ADDR), { maxInflight: BATCH + 1 });
-  pool.start();
+  const { pool, config, substrate } = makePool(new FakeSigner(ADDR), { maxInflight: BATCH + 1 });
+  const supervisor = new Supervisor({ ...config, confirmTickMs: 1 }, substrate);
+  await pool.start(); // boot reconcile before the confirm loop
+  supervisor.start();
 
   let maxRss = 0;
   const sampler = setInterval(() => { maxRss = Math.max(maxRss, process.memoryUsage().rss); }, 5);
@@ -135,12 +144,14 @@ async function benchBoundedMemory() {
   clearInterval(sampler);
   gc();
   const heapDelta = process.memoryUsage().heapUsed - heap0;
+  await supervisor.stop();
   await pool.stop();
 
   console.log(`\n[bounded memory — submit→confirm, ${fmt(ROUNDS * BATCH)} cycles in ${ROUNDS} rounds]`);
   console.log(`  heap after vs baseline: ${mb(heapDelta)} MB  (≈0 ⇒ in-flight state is released on settle)`);
   console.log(`  peak process RSS:       ${mb(maxRss)} MB`);
-  console.log(`  pool.stats() at end:    inflight=${pool.stats().wallets[0].inflightCount} stickyKeys=${pool.stats().stickyKeys}`);
+  const endStats = await pool.stats();
+  console.log(`  pool.stats() at end:    inflight=${endStats.wallets[0]?.inflightCount ?? 0} stickyKeys=${endStats.stickyKeys}`);
 }
 
 async function main() {

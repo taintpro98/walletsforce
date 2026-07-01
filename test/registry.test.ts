@@ -2,16 +2,18 @@ import { describe, it, expect } from "vitest";
 import { PoolRegistry } from "../src/registry";
 import { WalletForcePool } from "../src/pool";
 import { LegacyFeeOracle } from "../src/fee";
+import { createSubstrate } from "../src/substrate";
 import { FakeChainClient, FakeSigner, ADDR_A } from "./helpers";
 
 function pool(chainId: number) {
-  return new WalletForcePool({
+  const config = {
     ownerId: "t",
     chainId,
     signers: [new FakeSigner(ADDR_A)],
     chainClient: new FakeChainClient(),
     feeOracle: new LegacyFeeOracle({ minGasPriceWei: 1n }),
-  });
+  };
+  return new WalletForcePool(config, createSubstrate(config));
 }
 
 describe("PoolRegistry", () => {

@@ -13,13 +13,15 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { createPublicClient, http, encodeFunctionData, toHex, type Abi } from "viem";
-import { mnemonicToAccount } from "viem/accounts";
+import { createPublicClient, http, encodeFunctionData, type Abi } from "viem";
 import {
   WalletForcePool,
-  LocalKeySigner,
+  Supervisor,
+  createSubstrate,
+  deriveHDSigners,
   LegacyFeeOracle,
   ViemChainClient,
+  type WalletConfig,
 } from "walletsforce";
 
 const RPC_URL = process.env.RPC_URL ?? "http://127.0.0.1:8545";
@@ -46,28 +48,30 @@ try {
 }
 const { Counter } = deployments.contracts;
 
-// --- 10 signers, derived from the dev mnemonic ------------------------------
-const signers = Array.from({ length: SIGNER_COUNT }, (_, i) => {
-  const hd = mnemonicToAccount(MNEMONIC, { addressIndex: i });
-  return new LocalKeySigner(toHex(hd.getHdKey().privateKey!));
-});
+// --- 10 signers, derived from the dev mnemonic (one seed → the whole pool) ---
+const signers = deriveHDSigners(MNEMONIC, SIGNER_COUNT);
 
 const publicClient = createPublicClient({ transport: http(RPC_URL) });
-const pool = new WalletForcePool({
+// Pool and Supervisor share ONE substrate (cache + store + bus) in this process.
+const config: WalletConfig = {
   ownerId: "local-multi",
   chainId: deployments.chainId,
   signers, // ← 10 nonce lanes
   chainClient: new ViemChainClient(publicClient),
   feeOracle: new LegacyFeeOracle({ minGasPriceWei: 1_000_000_000n }),
   confirmations: 1,
-  confirmTickMs: 2_000, // let the burst broadcast before the first confirm tick
-});
+};
+const substrate = createSubstrate(config);
+const pool = new WalletForcePool(config, substrate);
+// confirmTickMs is a supervisor concern — let the burst broadcast before the first tick.
+const supervisor = new Supervisor({ ...config, confirmTickMs: 2_000 }, substrate);
 
 console.log(`chain ${deployments.chainId} @ ${RPC_URL}`);
 console.log(`pool with ${signers.length} signers:`);
 for (const s of signers) console.log(`  ${s.address}`);
 
-pool.start();
+await pool.start();  // boot reconcile (restore from store) before submitting
+supervisor.start();
 
 const readCount = () =>
   publicClient.readContract({ address: Counter.address, abi: Counter.abi, functionName: "count" }) as Promise<bigint>;
@@ -106,5 +110,6 @@ for (const s of signers) {
 }
 console.log(`\nCounter.count: ${before} -> ${after}  (+${after - before})`);
 
+await supervisor.stop();
 await pool.stop();
 console.log("\n✅ 10-signer fan-out demo complete");

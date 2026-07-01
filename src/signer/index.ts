@@ -12,3 +12,4 @@ export interface Signer {
 }
 
 export * from "./local-key.signer";
+export * from "./hd-wallet.signer";

@@ -5,7 +5,7 @@
 
 import type { Address } from "../types";
 import type { TransactionRecord, AccountRecord } from "../store";
-import type { PoolCache } from "./pool-cache";
+import type { PoolCache } from "./interface";
 
 const accountKey = (chainId: number, address: string) => `${chainId}:${address.toLowerCase()}`;
 

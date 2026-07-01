@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { SqliteStore, InMemoryStore, createStore } from "../src/store";
 import type { AccountRecord, TransactionRecord } from "../src/store";
 import { ADDR_A, ADDR_B, hash } from "./helpers";
@@ -101,6 +102,20 @@ describe("SqliteStore", () => {
     const active = await s2.loadActiveTransactions("o", 1);
     expect(active.map((t) => t.idempotencyKey)).toEqual(["live"]); // terminal 'done' retained but not active
     s2.close();
+  });
+
+  it("enables WAL journal mode on a file-backed db", async () => {
+    const path = tmpDb();
+    const s = new SqliteStore(path);
+    await s.upsertAccount(account()); // a write, so the -wal file materializes
+    // a second connection sees the persisted journal mode (createRequire avoids
+    // vite mangling the `node:sqlite` builtin specifier)
+    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+    const raw = new DatabaseSync(path);
+    const mode = (raw.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+    raw.close();
+    s.close();
+    expect(mode.toLowerCase()).toBe("wal");
   });
 
   it("scopes loads by ownerId + chainId", async () => {

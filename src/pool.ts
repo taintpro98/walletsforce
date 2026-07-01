@@ -23,7 +23,7 @@ import type { ManagedAccount } from "./account";
 import { DefaultRouter, LeastInflightSelector, type Router } from "./routing";
 import type { PoolStore } from "./store";
 import type { PoolCache } from "./cache";
-import type { EventBus } from "./events";
+import type { EventBus, WaitOptions } from "./events";
 import type { Substrate } from "./substrate";
 
 export interface PoolStats {
@@ -44,7 +44,7 @@ export interface IWalletForcePool {
   /** Resolve when this idempotencyKey reaches a terminal state. Resolves on
    *  `confirmed`; rejects on `reverted`/`failed`. Register it right after submit:
    *  it listens for FUTURE events and cannot observe one that already fired. */
-  waitForConfirmation(idempotencyKey: string): Promise<TxEventRecord>;
+  waitForConfirmation(idempotencyKey: string, opts?: WaitOptions): Promise<TxEventRecord>;
   reattach(tx: ReattachInput): Promise<void>;
   /** Rebuild in-flight state from the configured store. Call once on boot, BEFORE
    *  submitting new work. Returns how many transactions were restored. */
@@ -125,9 +125,10 @@ export class WalletForcePool implements IWalletForcePool {
   }
 
   /** Promise form of "wait for this tx" — delegates to the shared bus. Correlates
-   *  by idempotencyKey, NOT hash (the hash changes when a stuck tx is replaced). */
-  waitForConfirmation(idempotencyKey: string): Promise<TxEventRecord> {
-    return this.bus.waitForConfirmation(idempotencyKey);
+   *  by idempotencyKey, NOT hash (the hash changes when a stuck tx is replaced).
+   *  Pass `{ timeoutMs }` to bound the wait (a key that never settles hangs forever). */
+  waitForConfirmation(idempotencyKey: string, opts?: WaitOptions): Promise<TxEventRecord> {
+    return this.bus.waitForConfirmation(idempotencyKey, opts);
   }
 
   async reattach(tx: ReattachInput): Promise<void> {

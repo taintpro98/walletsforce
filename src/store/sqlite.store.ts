@@ -10,7 +10,7 @@
 // metadata as JSON; fees flattened into fee_type + gas_price / max_fee_* columns.
 
 import { createRequire } from "node:module";
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { Address, Hash, Hex, FeeFields } from "../types";
 import type { PoolStore } from "./interface";
 import type { AccountRecord, TransactionRecord } from "./models";
@@ -57,6 +57,49 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS ix_tx_owner_chain_status ON transactions (owner_id, chain_id, status);
 `;
 
+// WAL + synchronous=NORMAL: fsync at checkpoint instead of every commit — the single
+// biggest write-throughput lever. The durability window (a few last commits on an OS
+// crash) is acceptable because the pool reconciles from the store on boot via restore().
+// busy_timeout lets a second connection wait out the single writer instead of erroring.
+// (No-ops harmlessly for ":memory:", which can't use WAL.)
+const PRAGMAS = `
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+`;
+
+const UPSERT_ACCOUNT_SQL = `
+INSERT INTO accounts (owner_id, chain_id, address, derivation_index, nonce_cursor, balance_wei, healthy, updated_at)
+VALUES ($owner_id, $chain_id, $address, $derivation_index, $nonce_cursor, $balance_wei, $healthy, $updated_at)
+ON CONFLICT(chain_id, address) DO UPDATE SET
+  owner_id=excluded.owner_id, derivation_index=excluded.derivation_index,
+  nonce_cursor=excluded.nonce_cursor, balance_wei=excluded.balance_wei,
+  healthy=excluded.healthy, updated_at=excluded.updated_at`;
+
+const LOAD_ACCOUNTS_SQL = `SELECT * FROM accounts WHERE owner_id = ? AND chain_id = ?`;
+
+const UPSERT_TX_SQL = `
+INSERT INTO transactions (
+  idempotency_key, owner_id, chain_id, account, nonce, to_address, data, value, gas,
+  fee_type, gas_price, max_fee_per_gas, max_priority_fee_per_gas,
+  hash, status, attempts, submitted_at, mined_emitted, ordering_key, metadata, error, replaceable, updated_at)
+VALUES (
+  $idempotency_key, $owner_id, $chain_id, $account, $nonce, $to_address, $data, $value, $gas,
+  $fee_type, $gas_price, $max_fee_per_gas, $max_priority_fee_per_gas,
+  $hash, $status, $attempts, $submitted_at, $mined_emitted, $ordering_key, $metadata, $error, $replaceable, $updated_at)
+ON CONFLICT(idempotency_key) DO UPDATE SET
+  owner_id=excluded.owner_id, chain_id=excluded.chain_id, account=excluded.account, nonce=excluded.nonce,
+  to_address=excluded.to_address, data=excluded.data, value=excluded.value, gas=excluded.gas,
+  fee_type=excluded.fee_type, gas_price=excluded.gas_price, max_fee_per_gas=excluded.max_fee_per_gas,
+  max_priority_fee_per_gas=excluded.max_priority_fee_per_gas, hash=excluded.hash, status=excluded.status,
+  attempts=excluded.attempts, submitted_at=excluded.submitted_at, mined_emitted=excluded.mined_emitted,
+  ordering_key=excluded.ordering_key, metadata=excluded.metadata, error=excluded.error,
+  replaceable=excluded.replaceable, updated_at=excluded.updated_at`;
+
+const LOAD_ACTIVE_TX_SQL = `
+SELECT * FROM transactions
+WHERE owner_id = ? AND chain_id = ? AND status NOT IN ('confirmed','reverted','failed')`;
+
 // SQLite row shapes (TEXT/INTEGER/NULL as returned by node:sqlite).
 interface AccountRow {
   owner_id: string; chain_id: number; address: string; derivation_index: number | null;
@@ -86,12 +129,24 @@ const rowToFees = (r: TxRow): FeeFields =>
 export class SqliteStore implements PoolStore {
   private readonly db: DatabaseSync;
 
+  // Statements prepared ONCE (parse + plan) and reused across calls — a re-prepare
+  // per upsert/load is pure overhead in the durable hot path.
+  private readonly upsertAccountStmt: StatementSync;
+  private readonly loadAccountsStmt: StatementSync;
+  private readonly upsertTxStmt: StatementSync;
+  private readonly loadActiveTxStmt: StatementSync;
+
   /** @param path a file path for durability (e.g. "walletsforce.sqlite"), or ":memory:"
    *  for an ephemeral per-connection DB (tests). */
   constructor(path: string) {
     const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
     this.db = new DatabaseSync(path);
+    this.db.exec(PRAGMAS);
     this.db.exec(DDL);
+    this.upsertAccountStmt = this.db.prepare(UPSERT_ACCOUNT_SQL);
+    this.loadAccountsStmt = this.db.prepare(LOAD_ACCOUNTS_SQL);
+    this.upsertTxStmt = this.db.prepare(UPSERT_TX_SQL);
+    this.loadActiveTxStmt = this.db.prepare(LOAD_ACTIVE_TX_SQL);
   }
 
   /** Close the underlying database handle. */
@@ -100,15 +155,7 @@ export class SqliteStore implements PoolStore {
   }
 
   async upsertAccount(rec: AccountRecord): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO accounts (owner_id, chain_id, address, derivation_index, nonce_cursor, balance_wei, healthy, updated_at)
-         VALUES ($owner_id, $chain_id, $address, $derivation_index, $nonce_cursor, $balance_wei, $healthy, $updated_at)
-         ON CONFLICT(chain_id, address) DO UPDATE SET
-           owner_id=excluded.owner_id, derivation_index=excluded.derivation_index,
-           nonce_cursor=excluded.nonce_cursor, balance_wei=excluded.balance_wei,
-           healthy=excluded.healthy, updated_at=excluded.updated_at`,
-      )
+    this.upsertAccountStmt
       .run({
         owner_id: rec.ownerId,
         chain_id: rec.chainId,
@@ -122,9 +169,7 @@ export class SqliteStore implements PoolStore {
   }
 
   async loadAccounts(ownerId: string, chainId: number): Promise<AccountRecord[]> {
-    const rows = this.db
-      .prepare(`SELECT * FROM accounts WHERE owner_id = ? AND chain_id = ?`)
-      .all(ownerId, chainId) as unknown as AccountRow[];
+    const rows = this.loadAccountsStmt.all(ownerId, chainId) as unknown as AccountRow[];
     return rows.map((r) => ({
       ownerId: r.owner_id,
       chainId: r.chain_id,
@@ -140,25 +185,7 @@ export class SqliteStore implements PoolStore {
   async upsertTransaction(rec: TransactionRecord): Promise<void> {
     // Durable store retains terminal rows as history (unlike the in-memory store).
     const fees = feesToRow(rec.fees);
-    this.db
-      .prepare(
-        `INSERT INTO transactions (
-           idempotency_key, owner_id, chain_id, account, nonce, to_address, data, value, gas,
-           fee_type, gas_price, max_fee_per_gas, max_priority_fee_per_gas,
-           hash, status, attempts, submitted_at, mined_emitted, ordering_key, metadata, error, replaceable, updated_at)
-         VALUES (
-           $idempotency_key, $owner_id, $chain_id, $account, $nonce, $to_address, $data, $value, $gas,
-           $fee_type, $gas_price, $max_fee_per_gas, $max_priority_fee_per_gas,
-           $hash, $status, $attempts, $submitted_at, $mined_emitted, $ordering_key, $metadata, $error, $replaceable, $updated_at)
-         ON CONFLICT(idempotency_key) DO UPDATE SET
-           owner_id=excluded.owner_id, chain_id=excluded.chain_id, account=excluded.account, nonce=excluded.nonce,
-           to_address=excluded.to_address, data=excluded.data, value=excluded.value, gas=excluded.gas,
-           fee_type=excluded.fee_type, gas_price=excluded.gas_price, max_fee_per_gas=excluded.max_fee_per_gas,
-           max_priority_fee_per_gas=excluded.max_priority_fee_per_gas, hash=excluded.hash, status=excluded.status,
-           attempts=excluded.attempts, submitted_at=excluded.submitted_at, mined_emitted=excluded.mined_emitted,
-           ordering_key=excluded.ordering_key, metadata=excluded.metadata, error=excluded.error,
-           replaceable=excluded.replaceable, updated_at=excluded.updated_at`,
-      )
+    this.upsertTxStmt
       .run({
         idempotency_key: rec.idempotencyKey,
         owner_id: rec.ownerId,
@@ -184,12 +211,7 @@ export class SqliteStore implements PoolStore {
   }
 
   async loadActiveTransactions(ownerId: string, chainId: number): Promise<TransactionRecord[]> {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM transactions
-         WHERE owner_id = ? AND chain_id = ? AND status NOT IN ('confirmed','reverted','failed')`,
-      )
-      .all(ownerId, chainId) as unknown as TxRow[];
+    const rows = this.loadActiveTxStmt.all(ownerId, chainId) as unknown as TxRow[];
     return rows.map((r) => ({
       idempotencyKey: r.idempotency_key,
       ownerId: r.owner_id,

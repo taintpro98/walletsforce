@@ -3,5 +3,5 @@
 // of the same interface shares it across pods (group mode). Pairs with a PoolStore
 // (the durable record).
 
-export * from "./pool-cache";
+export * from "./interface";
 export * from "./in-memory.cache";

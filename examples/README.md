@@ -1,34 +1,46 @@
 # Examples
 
-A **standalone TypeScript project** that consumes the published `walletsforce`
-package from npm — exactly as a real user would. It has its own `package.json`,
-`tsconfig.json`, and `node_modules`, independent of the library repo.
+A **standalone TypeScript project** with its own `package.json`, `tsconfig.json`,
+and `node_modules`. It's linked to the **local build** of the library
+(`"walletsforce": "file:.."` in `package.json`), so the examples always reflect
+your working tree — no publish step needed.
 
 ## Setup
 
 ```bash
+# from the repo root: build the library the examples resolve to
+npm run build
+
 cd examples
-npm install
+npm install            # creates the file:.. symlink to the repo root
 ```
 
-This installs `walletsforce` from the npm registry (see the version in
-`package.json`). To test against **local, unpublished** changes instead, run
-`npm link` in the repo root and `npm link walletsforce` here.
+The examples resolve `walletsforce` → the repo root's `dist/`. After changing
+library `src/`, re-run `npm run build` at the root and the examples pick it up
+automatically (no re-copy, no re-link).
+
+> **viem must stay aligned.** The root and `examples/` each install their own
+> `viem` under `^2.21.0`. If a reinstall gives them different 2.x versions,
+> `ViemChainClient(publicClient)` will hit a duplicate-viem type clash — reinstall
+> both to the same version. (This is the tradeoff of a `file:..` link vs. an npm
+> workspace.)
 
 ## Run
 
 ```bash
-npm run basic          # offline, zero setup
+npm run basic          # offline, zero setup: submit → supervisor confirms
 npm run contract-call  # offline: encode + submit an ERC-20 contract call
+npm run durable        # offline: SQLite store survives a "crash" → restore() recovers it
 npm run local          # local chain: 10-signer pool fans calls across lanes
 npm run funder         # local chain: TreasuryFunder auto-refills a drained signer
 npm run testnet        # real on-chain send (needs env vars)
+npm run profile        # measure the library's own CPU / RAM overhead
 npm run typecheck      # tsc --noEmit over the examples
 ```
 
-> `funder.ts` needs **walletsforce ≥ 0.1.0** (`TreasuryFunder`). Until 0.1.0 is
-> published, link the local build (`npm link` in the repo root, then
-> `npm link walletsforce` here).
+Each demo builds a `config`, a `substrate` (`createSubstrate`), a `WalletForcePool`,
+and a `Supervisor`, then `await pool.start()` + `supervisor.start()` — the standard
+single-pod wiring.
 
 Examples run directly from TypeScript via [`tsx`](https://github.com/privatenumber/tsx) — no build step.
 
@@ -43,6 +55,14 @@ Shows that walletsforce is ABI-agnostic: you encode calldata yourself (viem's
 `encodeFunctionData`) and pass it as the tx `data`; `to` is the contract address.
 Encodes an ERC-20 `transfer(address,uint256)` and submits it against an inline
 fake `ChainClient`. No RPC, no funds.
+
+## `durable.ts` — SQLite crash recovery (offline)
+
+Selects the SQLite store (`createSubstrate(config, { store: { kind: "sqlite", path } })`),
+submits a tx (write-ahead-persisted before broadcast), throws away the pool **without
+confirming** (a simulated crash), then builds a fresh pool over the **same file** and
+`await pool.start()` — `restore()` re-tracks the in-flight tx and the supervisor
+confirms it. No RPC. Needs Node ≥ 22.5 (`node:sqlite`).
 
 ## `funder.ts` — auto-refill a drained account (local chain)
 

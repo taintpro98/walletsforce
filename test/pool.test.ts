@@ -133,9 +133,24 @@ describe("WalletForcePool.waitForConfirmation", () => {
     sup.start();
     await expect(waiter).rejects.toThrow(/reverted/);
   });
+
+  it("rejects on timeout when nothing settles (no leak)", async () => {
+    const { pool } = makePool();
+    // no supervisor started -> "ghost" never reaches terminal
+    await expect(pool.waitForConfirmation("ghost", { timeoutMs: 20 })).rejects.toThrow(/timed out/);
+  });
 });
 
 describe("WalletForcePool events / state", () => {
+  it("isolates a throwing event listener (submit still resolves, others still fire)", async () => {
+    const { pool } = makePool();
+    const seen: string[] = [];
+    pool.on("broadcast", () => { throw new Error("boom"); }); // bad subscriber
+    pool.on("broadcast", (r) => seen.push(r.idempotencyKey)); // must still run
+    await expect(pool.submit({ to: ADDR_A }, { idempotencyKey: "k1" })).resolves.toBeTruthy();
+    expect(seen).toContain("k1");
+  });
+
   it("off() removes a listener", async () => {
     const { pool } = makePool();
     const seen: TxEventRecord[] = [];

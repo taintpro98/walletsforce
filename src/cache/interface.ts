@@ -9,8 +9,6 @@
 // rebuilt from the store; during operation both are written (cache for speed +
 // coordination, store for durability). The cache holds only the ACTIVE set; the
 // store keeps full history.
-//
-// DRAFT — interface for review before implementation.
 
 import type { Address } from "../types";
 import type { TransactionRecord, AccountRecord } from "../store";

@@ -1,6 +1,6 @@
 {
   "name": "walletsforce",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "General-purpose in-memory EVM account pool: route, nonce-lane, sign, broadcast, confirm, and replace transactions across many signer addresses.",
   "repository": {
     "type": "git",

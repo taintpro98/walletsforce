@@ -1,17 +1,45 @@
 # walletsforce
 
-A general-purpose **EVM account pool**. Give it a set of signer accounts and a
-chain; call `submit(tx)`. It routes the tx to an account, serializes that
-account's nonce lane, signs, broadcasts, confirms, and replaces stuck txs — so
-your service stops managing nonce lanes and just says "send this".
+**Send lots of transactions to an EVM chain, fast, from many wallets — without
+babysitting nonces.** Give it a set of signer accounts and a chain; call
+`submit(tx)`. It picks a wallet, orders that wallet's nonces, signs, broadcasts,
+waits for confirmation, and replaces stuck txs — so your service stops managing
+nonce bookkeeping and just says "send this".
 
-N accounts = N independent nonce lanes ⇒ you break the single-account
-sequential-nonce throughput ceiling, with head-of-line blocking confined to one
-lane.
+## The problem it solves
+
+On an EVM chain, every account sends transactions through a **nonce** — a
+strictly sequential counter (0, 1, 2, …). The chain will not mine nonce 5 until
+nonce 4 is in. So **one wallet can only push transactions one-at-a-time, in
+order**: if the tx at nonce 4 gets stuck (underpriced gas, dropped from the
+mempool), *everything behind it is blocked too* — this is head-of-line blocking.
+That single-wallet sequential-nonce limit is a hard ceiling on how many txs per
+second you can land. And doing it by hand is fiddly: you have to track the next
+nonce, avoid gaps and collisions, price gas, detect stuck txs, re-sign them with
+a higher fee, and not lose the in-flight ones if your process crashes.
+
+**walletsforce turns that into a pool of wallets.** Each wallet is one
+independent nonce lane, so **N wallets = N transactions in flight at once** — you
+break the single-wallet ceiling, and a stuck tx only blocks its own lane, not the
+others. All the fiddly parts (nonce ordering, gas, fees, broadcast, confirmation,
+stuck-tx replacement, crash recovery) are handled for you behind `submit(tx)`.
 
 > See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the landscape diagram and every
 > component interface in one place, and [`examples/`](./examples) for runnable
 > demos (`basic`, `contract-call`, `local`, `funder`, `durable`, `testnet`).
+
+---
+
+## Prerequisites
+
+- **Node ≥ 18** for the in-memory path; **Node ≥ 22.5** if you use the SQLite store
+  (it relies on the built-in `node:sqlite`).
+- An **ESM project** (`"type": "module"`) — walletsforce is ESM-only.
+- **`viem`** installed alongside it (it's a peer dependency — see [Install](#install)).
+- An **EVM JSON-RPC endpoint** to read from and broadcast to (an `RPC_URL`).
+- **One or more signer accounts, each funded with native gas** — a mnemonic to derive
+  lanes from (the usual way), or individual private keys / a KMS. Each account is one
+  nonce lane and must hold gas to send.
 
 ---
 
@@ -22,51 +50,7 @@ npm install walletsforce viem
 ```
 
 `viem` is a **peer dependency** (you provide it, so there's one copy). `zod` is a
-regular dependency and installs automatically. walletsforce is **ESM-only**
-(`"type": "module"`). Node **≥ 18** for the in-memory path; the SQLite store needs
-Node **≥ 22.5** (built-in `node:sqlite`).
-
----
-
-## Mental model
-
-walletsforce is three things you wire together:
-
-- **`WalletForcePool`** — the **submit** surface: route → nonce → gas → fees → sign
-  → broadcast. Reactive; has no background loop.
-- **`Supervisor`** — the **reconcile** loop: on a timer it confirms/replaces stuck
-  txs and refreshes balances (and refills, if you give it a funder). You start it.
-- **`Substrate`** — the shared runtime both run over: **cache** (fast working set:
-  nonce lanes, in-flight, routing), **store** (durable record), **event bus**
-  (`on`/`waitForConfirmation`), and the **account set**. Built **once** with
-  `createSubstrate(config)` and injected into both, so a submit and its
-  confirmation meet over one working set.
-
-Two deployment shapes fall out of this:
-
-| Mode | Cache / Store / Bus | Topology |
-|---|---|---|
-| **individual** (default) | in-memory | one process runs Pool **and** Supervisor |
-| **group** | shared (Redis / SQL) | many submit pods run Pools; **one** pod runs the Supervisor |
-
-Run the Supervisor in exactly **one** place per account set — the tick must not
-run concurrently on many pods.
-
----
-
-## The contract
-
-| walletsforce **guarantees** | **you** own |
-|---|---|
-| correct, gap-free nonce per account | idempotency / dedupe on your business unit |
-| single-writer per account (static partition) | exactly-once *effect* across a crash |
-| no in-process duplicate sends | choosing durability: in-memory (default) or a durable store |
-| receipt tracking + stuck-tx replacement | running the Supervisor in exactly one place (group mode) |
-
-Durability is a **choice**: with the default in-memory store nothing survives a
-crash; inject the **SQLite store** (or your own `PoolStore`) and the pool
-write-aheads before broadcast and rebuilds on boot via `restore()`. See
-[Durability](#durability--crash-recovery).
+regular dependency and installs automatically.
 
 ---
 
@@ -139,6 +123,48 @@ pool.on("reverted", (rec) => console.warn("reverted", rec.hash));
 - `opts.orderingKey` (optional): see [Ordered vs unordered](#ordered-vs-unordered).
 - `opts.metadata` (optional): opaque, echoed back on events. Must be JSON-serializable
   if you use a durable store (it's persisted as JSON).
+
+---
+
+## Mental model
+
+walletsforce is three things you wire together:
+
+- **`WalletForcePool`** — the **submit** surface: route → nonce → gas → fees → sign
+  → broadcast. Reactive; has no background loop.
+- **`Supervisor`** — the **reconcile** loop: on a timer it confirms/replaces stuck
+  txs and refreshes balances (and refills, if you give it a funder). You start it.
+- **`Substrate`** — the shared runtime both run over: **cache** (fast working set:
+  nonce lanes, in-flight, routing), **store** (durable record), **event bus**
+  (`on`/`waitForConfirmation`), and the **account set**. Built **once** with
+  `createSubstrate(config)` and injected into both, so a submit and its
+  confirmation meet over one working set.
+
+Two deployment shapes fall out of this:
+
+| Mode | Cache / Store / Bus | Topology |
+|---|---|---|
+| **individual** (default) | in-memory | one process runs Pool **and** Supervisor |
+| **group** | shared (Redis / SQL) | many submit pods run Pools; **one** pod runs the Supervisor |
+
+Run the Supervisor in exactly **one** place per account set — the tick must not
+run concurrently on many pods.
+
+---
+
+## The contract
+
+| walletsforce **guarantees** | **you** own |
+|---|---|
+| correct, gap-free nonce per account | idempotency / dedupe on your business unit |
+| single-writer per account (static partition) | exactly-once *effect* across a crash |
+| no in-process duplicate sends | choosing durability: in-memory (default) or a durable store |
+| receipt tracking + stuck-tx replacement | running the Supervisor in exactly one place (group mode) |
+
+Durability is a **choice**: with the default in-memory store nothing survives a
+crash; inject the **SQLite store** (or your own `PoolStore`) and the pool
+write-aheads before broadcast and rebuilds on boot via `restore()`. See
+[Durability](#durability--crash-recovery).
 
 ---
 

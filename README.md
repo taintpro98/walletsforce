@@ -77,7 +77,7 @@ import {
   WalletForcePool,
   Supervisor,
   createSubstrate,
-  LocalKeySigner,
+  deriveHDSigners,
   LegacyFeeOracle,
   ViemChainClient,
   type WalletConfig,
@@ -85,9 +85,9 @@ import {
 import { createPublicClient, http } from "viem";
 
 // 1. The owned account set — one nonce lane each. More accounts = more throughput.
-const signers = [process.env.KEY_A, process.env.KEY_B, process.env.KEY_C].map(
-  (k) => new LocalKeySigner(k as `0x${string}`),
-);
+//    Derive N accounts from ONE mnemonic (BIP-44 m/44'/60'/0'/0/i) — the usual way.
+//    (For individual keys / KMS, use `new LocalKeySigner(pk)` or your own Signer.)
+const signers = deriveHDSigners(process.env.MNEMONIC!, 10); // 10 lanes from one seed
 
 // 2. Shared identity + account inputs (the three seams live here too).
 const config: WalletConfig = {
